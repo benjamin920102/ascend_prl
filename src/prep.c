@@ -1,6 +1,7 @@
 /*
- * Integrated prep.c
- * Combines high-level API for miner.c with SIMD optimizations (AVX2, AVX-512, NEON)
+ * CANN / Ascend NPU Compatible prep.c
+ * - Optimized for ARM NEON / AVX SIMD
+ * - 64-byte Aligned Memory Allocation for CANN/ACL DMA compatibility
  */
 
 #include <stdint.h>
@@ -29,10 +30,8 @@
 #endif
 
 /* =====================================================
-   SIMD Worker Implementations
+   SIMD Accelerators (u2i_worker)
    ===================================================== */
-
-// --- 1. u2i_worker (Byte masking and conversion) ---
 
 #ifdef SIMD_AVX512
 static void u2i_worker_avx512(const uint8_t *raw, int8_t *out, int64_t n) {
@@ -92,7 +91,7 @@ static void u2i_worker_scalar(const uint8_t *raw, int8_t *out, int64_t n) {
     }
 }
 
-void u2i_worker_simd(const uint8_t *raw, int8_t *out, int64_t n) {
+static inline void prep_random_simd(const uint8_t *raw, int8_t *out, int64_t n) {
 #ifdef SIMD_AVX512
     u2i_worker_avx512(raw, out, n);
 #elif defined(SIMD_AVX2)
@@ -104,9 +103,15 @@ void u2i_worker_simd(const uint8_t *raw, int8_t *out, int64_t n) {
 #endif
 }
 
-// --- 2. an_worker (Matrix A noise application) ---
+/* =====================================================
+   High-Level APIs (Required by miner.c)
+   ===================================================== */
 
-static void an_worker_scalar(
+void prep_random(const uint8_t *raw, int8_t *out, int64_t n) {
+    prep_random_simd(raw, out, n);
+}
+
+void prep_a_side(
     const int8_t *A, const int8_t *EAL, int8_t *out,
     const uint16_t *f, const uint16_t *s,
     int64_t m, int64_t k, int R) {
@@ -120,23 +125,14 @@ static void an_worker_scalar(
     }
 }
 
-void an_worker_simd(
-    const int8_t *A, const int8_t *EAL, int8_t *out,
-    const uint16_t *f, const uint16_t *s,
-    int64_t m, int64_t k, int R) {
-    // Currently uses scalar logic for scatter/gather efficiency, extensible to SIMD
-    an_worker_scalar(A, EAL, out, f, s, m, k, R);
-}
-
-// --- 3. bn_pack_worker (Matrix B transpose + noise + pack) ---
-
-static void bn_pack_worker_scalar(
+void prep_b_side(
     const int8_t *B, const int8_t *EBR, int8_t *bt,
     const uint16_t *f, const uint16_t *s,
     int64_t k, int64_t n, int R) {
+    
     int64_t nbands = n / 64;
     int64_t NFOLD = k / R;
-    
+
     for (int64_t jp = 0; jp < nbands; jp++) {
         for (int64_t p = 0; p < NFOLD; p++) {
             for (int64_t m = 0; m < 64; m++) {
@@ -144,7 +140,7 @@ static void bn_pack_worker_scalar(
                 const int8_t *bcol = B + col * k;
                 const int8_t *ecol = EBR + col * R;
                 int8_t *dst = bt + ((jp * NFOLD + p) * 64 + m) * R;
-                
+
                 for (int64_t ki = 0; ki < R; ki++) {
                     int64_t row = p * R + ki;
                     dst[ki] = (int8_t)(bcol[row] + ecol[f[row]] - ecol[s[row]]);
@@ -154,55 +150,28 @@ static void bn_pack_worker_scalar(
     }
 }
 
-void bn_pack_worker_simd(
-    const int8_t *B, const int8_t *EBR, int8_t *bt,
-    const uint16_t *f, const uint16_t *s,
-    int64_t k, int64_t n, int R) {
-    bn_pack_worker_scalar(B, EBR, bt, f, s, k, n, R);
-}
-
-
-/* =====================================================
-   High-Level APIs Required by miner.c
-   ===================================================== */
-
-void prep_random(const uint8_t *raw, int8_t *out, int64_t n) {
-    u2i_worker_simd(raw, out, n);
-}
-
-void prep_a_side(
-    const int8_t *A, const int8_t *EAL, int8_t *out,
-    const uint16_t *f, const uint16_t *s,
-    int64_t m, int64_t k, int R) {
-    an_worker_simd(A, EAL, out, f, s, m, k, R);
-}
-
-void prep_b_side(
-    const int8_t *B, const int8_t *EBR, int8_t *bt,
-    const uint16_t *f, const uint16_t *s,
-    int64_t k, int64_t n, int R) {
-    bn_pack_worker_simd(B, EBR, bt, f, s, k, n, R);
-}
-
 void prep_random_bt(
     const uint8_t *raw_b, const int8_t *EBR, int8_t *bt,
     const uint16_t *f, const uint16_t *s,
     int64_t k, int64_t n, int R) {
     
-    // Allocate temporary converted matrix B buffer
-    int8_t *b_conv = (int8_t *)malloc(k * n * sizeof(int8_t));
-    if (!b_conv) return;
+    int64_t total = k * n;
+    int8_t *b_conv = NULL;
 
-    // Step 1: Raw bytes conversion via SIMD
-    u2i_worker_simd(raw_b, b_conv, k * n);
+    // Use 64-byte alignment mandatory for CANN / Ascend NPU DMA Engine
+    if (posix_memalign((void **)&b_conv, 64, total) != 0 || !b_conv) {
+        return;
+    }
 
-    // Step 2: Matrix B pack & noise application
-    bn_pack_worker_simd(b_conv, EBR, bt, f, s, k, n, R);
+    // Step 1: SIMD conversion
+    prep_random_simd(raw_b, b_conv, total);
+
+    // Step 2: B-side pack
+    prep_b_side(b_conv, EBR, bt, f, s, k, n, R);
 
     free(b_conv);
 }
 
-/* Helper Utilities */
 const char* simd_level_string(void) {
 #ifdef SIMD_AVX512
     return "AVX-512";
