@@ -1,7 +1,8 @@
 /*
- * CANN / Ascend NPU Compatible prep.c
+ * Ascend CANN NPU Compatible prep.c
  * - Optimized for ARM NEON / AVX SIMD
- * - 64-byte Aligned Memory Allocation for CANN/ACL DMA compatibility
+ * - 64-byte Memory Alignment for CANN DMA engine
+ * - Memory Barriers to resolve Worker Synchronization Freeze
  */
 
 #include <stdint.h>
@@ -28,6 +29,9 @@
     #define SIMD_SCALAR
     #define SIMD_LEVEL 0
 #endif
+
+/* Memory Barrier for CPU-CANN DMA Synchronization */
+#define COMPILER_BARRIER() __asm__ __volatile__("" ::: "memory")
 
 /* =====================================================
    SIMD Accelerators (u2i_worker)
@@ -109,6 +113,7 @@ static inline void prep_random_simd(const uint8_t *raw, int8_t *out, int64_t n) 
 
 void prep_random(const uint8_t *raw, int8_t *out, int64_t n) {
     prep_random_simd(raw, out, n);
+    COMPILER_BARRIER();
 }
 
 void prep_a_side(
@@ -123,6 +128,7 @@ void prep_a_side(
             o[j] = (int8_t)(ar[j] + el[f[j]] - el[s[j]]);
         }
     }
+    COMPILER_BARRIER();
 }
 
 void prep_b_side(
@@ -148,6 +154,7 @@ void prep_b_side(
             }
         }
     }
+    COMPILER_BARRIER();
 }
 
 void prep_random_bt(
@@ -158,7 +165,7 @@ void prep_random_bt(
     int64_t total = k * n;
     int8_t *b_conv = NULL;
 
-    // Use 64-byte alignment mandatory for CANN / Ascend NPU DMA Engine
+    // Allocate 64-byte aligned memory for Ascend CANN DMA Alignment
     if (posix_memalign((void **)&b_conv, 64, total) != 0 || !b_conv) {
         return;
     }
@@ -166,8 +173,11 @@ void prep_random_bt(
     // Step 1: SIMD conversion
     prep_random_simd(raw_b, b_conv, total);
 
-    // Step 2: B-side pack
+    // Step 2: B-side pack logic
     prep_b_side(b_conv, EBR, bt, f, s, k, n, R);
+
+    // Flush cache & sync memory for CANN Host-to-Device Copy
+    COMPILER_BARRIER();
 
     free(b_conv);
 }
