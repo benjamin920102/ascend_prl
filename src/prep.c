@@ -1,199 +1,336 @@
 /*
- * Ascend CANN NPU Compatible prep.c
- * - Optimized for ARM NEON / AVX SIMD
- * - 64-byte Memory Alignment for CANN DMA engine
- * - Memory Barriers to resolve Worker Synchronization Freeze
+ * Pearl miner CPU prep in C.
+ * Fixed for Thread-Safety, Memory Alignment & Ascend CANN NPU Stability.
  */
-
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include "blake3.h"
 
-/* =====================================================
-   SIMD Detection and Capability Flags
-   ===================================================== */
+#define DIGEST 32
+#define ZERO_POINT 32
+#define RANGE_MASK 63
 
-#if defined(__AVX512F__) && defined(__AVX512BW__)
-    #define SIMD_AVX512
-    #define SIMD_LEVEL 512
-    #include <immintrin.h>
-#elif defined(__AVX2__)
-    #define SIMD_AVX2
-    #define SIMD_LEVEL 256
-    #include <immintrin.h>
-#elif defined(__ARM_NEON__)
-    #define SIMD_NEON
-    #define SIMD_LEVEL 128
-    #include <arm_neon.h>
+/* ------------------------------------------------------------------ utils */
+
+typedef struct { int t, nt; void *ctx; } span_t;
+
+static void run_threads(int nt, void *(*fn)(void *), void *ctx) {
+    if (nt <= 1) {
+        span_t single_span = { 0, 1, ctx };
+        fn(&single_span);
+        return;
+    }
+    pthread_t th[256];
+    span_t spans[256];
+    if (nt > 256) nt = 256;
+    for (int i = 0; i < nt; i++) { spans[i].t = i; spans[i].nt = nt; spans[i].ctx = ctx; }
+    for (int i = 0; i < nt; i++) pthread_create(&th[i], 0, fn, &spans[i]);
+    for (int i = 0; i < nt; i++) pthread_join(th[i], 0);
+}
+
+/* xoshiro256** seeded via splitmix64 */
+typedef struct { uint64_t s[4]; } rng_t;
+static uint64_t splitmix(uint64_t *x) {
+    uint64_t z = (*x += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+static void rng_seed(rng_t *r, uint64_t seed) { for (int i = 0; i < 4; i++) r->s[i] = splitmix(&seed); }
+static inline uint64_t rotl64(uint64_t x, int k) { return (x << k) | (x >> (64 - k)); }
+static inline uint64_t rng_next(rng_t *r) {
+    uint64_t *s = r->s, res = rotl64(s[1] * 5, 7) * 9, t = s[1] << 17;
+    s[2] ^= s[0]; s[3] ^= s[1]; s[1] ^= s[2]; s[0] ^= s[3]; s[2] ^= t; s[3] = rotl64(s[3], 45);
+    return res;
+}
+
+/* keyed blake3 of message = int32[8]{ [slot]=1+idx } || seed32 */
+static void draw_hash(uint32_t idx, const uint8_t *seed, const uint8_t *key,
+                      int slot, uint8_t out[DIGEST]) {
+    uint8_t msg[64] = {0};
+    uint32_t v = idx + 1;
+    memcpy(msg + slot * 4, &v, 4);          /* LE */
+    memcpy(msg + 32, seed, 32);
+    blake3_hasher h;
+    blake3_hasher_init_keyed(&h, key);
+    blake3_hasher_update(&h, msg, 64);
+    blake3_hasher_finalize(&h, out, DIGEST);
+}
+
+/* ----------------------------------------------------- random A/B (int8) */
+
+typedef struct { int8_t *buf; int64_t total; uint64_t seed; } fill_ctx;
+static void *fill_worker(void *a) {
+    span_t *sp = a; fill_ctx *c = sp->ctx;
+    int64_t lo = c->total * sp->t / sp->nt, hi = c->total * (sp->t + 1) / sp->nt;
+    rng_t r; rng_seed(&r, c->seed + 0x9E37 * (uint64_t)(sp->t + 1));
+    int64_t i = lo;
+    while (i < hi) {
+        uint64_t v = rng_next(&r);
+        for (int b = 0; b < 8 && i < hi; b++, v >>= 8)
+            c->buf[i++] = (int8_t)((uint8_t)v % 127) - 63;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------- merkle root (keyed b3) */
+
+typedef struct { const int8_t *buf; int64_t len; const uint8_t *key; uint8_t *root; } mk_ctx;
+static void *mk_worker(void *a) {
+    mk_ctx *c = a;
+    blake3_hasher h;
+    blake3_hasher_init_keyed(&h, c->key);
+#if defined(BLAKE3_USE_TBB)
+    blake3_hasher_update_tbb(&h, c->buf, (size_t)c->len);
 #else
-    #define SIMD_SCALAR
-    #define SIMD_LEVEL 0
+    blake3_hasher_update(&h, c->buf, (size_t)c->len);
 #endif
-
-/* Memory Barrier for CPU-CANN DMA Synchronization */
-#define COMPILER_BARRIER() __asm__ __volatile__("" ::: "memory")
-
-/* =====================================================
-   SIMD Accelerators (u2i_worker)
-   ===================================================== */
-
-#ifdef SIMD_AVX512
-static void u2i_worker_avx512(const uint8_t *raw, int8_t *out, int64_t n) {
-    __m512i mask_vec = _mm512_set1_epi8(0x3F);
-    __m512i offset_vec = _mm512_set1_epi8(32);
-    int64_t i = 0;
-    for (; i + 63 < n; i += 64) {
-        __m512i raw_vec = _mm512_loadu_si512((__m512i *)(raw + i));
-        __m512i masked = _mm512_and_si512(raw_vec, mask_vec);
-        __m512i result = _mm512_sub_epi8(masked, offset_vec);
-        _mm512_storeu_si512((__m512i *)(out + i), result);
-    }
-    for (; i < n; i++) {
-        out[i] = (int8_t)((raw[i] & 0x3F) - 32);
-    }
-}
-#endif
-
-#ifdef SIMD_AVX2
-static void u2i_worker_avx2(const uint8_t *raw, int8_t *out, int64_t n) {
-    __m256i mask_vec = _mm256_set1_epi8(0x3F);
-    __m256i offset_vec = _mm256_set1_epi8(32);
-    int64_t i = 0;
-    for (; i + 31 < n; i += 32) {
-        __m256i raw_vec = _mm256_loadu_si256((__m256i *)(raw + i));
-        __m256i masked = _mm256_and_si256(raw_vec, mask_vec);
-        __m256i result = _mm256_sub_epi8(masked, offset_vec);
-        _mm256_storeu_si256((__m256i *)(out + i), result);
-    }
-    for (; i < n; i++) {
-        out[i] = (int8_t)((raw[i] & 0x3F) - 32);
-    }
-}
-#endif
-
-#ifdef SIMD_NEON
-static void u2i_worker_neon(const uint8_t *raw, int8_t *out, int64_t n) {
-    uint8x16_t mask_vec = vdupq_n_u8(0x3F);
-    int8x16_t offset_vec = vdupq_n_s8(32);
-    int64_t i = 0;
-    for (; i + 15 < n; i += 16) {
-        uint8x16_t raw_vec = vld1q_u8(raw + i);
-        uint8x16_t masked = vandq_u8(raw_vec, mask_vec);
-        int8x16_t masked_s8 = vreinterpretq_s8_u8(masked);
-        int8x16_t result = vsubq_s8(masked_s8, offset_vec);
-        vst1q_s8(out + i, result);
-    }
-    for (; i < n; i++) {
-        out[i] = (int8_t)((raw[i] & 0x3F) - 32);
-    }
-}
-#endif
-
-static void u2i_worker_scalar(const uint8_t *raw, int8_t *out, int64_t n) {
-    for (int64_t i = 0; i < n; i++) {
-        out[i] = (int8_t)((raw[i] & 0x3F) - 32);
-    }
+    blake3_hasher_finalize(&h, c->root, DIGEST);
+    return 0;
 }
 
-static inline void prep_random_simd(const uint8_t *raw, int8_t *out, int64_t n) {
-#ifdef SIMD_AVX512
-    u2i_worker_avx512(raw, out, n);
-#elif defined(SIMD_AVX2)
-    u2i_worker_avx2(raw, out, n);
-#elif defined(SIMD_NEON)
-    u2i_worker_neon(raw, out, n);
-#else
-    u2i_worker_scalar(raw, out, n);
-#endif
+/* ----------------------------------------------------------- noise draws */
+
+typedef struct { uint8_t *out; int64_t nbytes; const uint8_t *seed, *key; int slot; } unif_ctx;
+static void *unif_worker(void *a) {
+    span_t *sp = a; unif_ctx *c = sp->ctx;
+    int64_t draws = (c->nbytes + DIGEST - 1) / DIGEST;
+    int64_t lo = draws * sp->t / sp->nt, hi = draws * (sp->t + 1) / sp->nt;
+    for (int64_t i = lo; i < hi; i++) {
+        uint8_t d[DIGEST];
+        draw_hash((uint32_t)i, c->seed, c->key, c->slot, d);
+        int64_t off = i * DIGEST, n = c->nbytes - off; if (n > DIGEST) n = DIGEST;
+        memcpy(c->out + off, d, (size_t)n);
+    }
+    return 0;
 }
 
-/* =====================================================
-   High-Level APIs (Required by miner.c)
-   ===================================================== */
-
-void prep_random(const uint8_t *raw, int8_t *out, int64_t n) {
-    prep_random_simd(raw, out, n);
-    COMPILER_BARRIER();
+typedef struct { uint8_t *raw; int8_t *out; int64_t n; } u2i_ctx;
+static void *u2i_worker(void *a) {
+    span_t *sp = a; u2i_ctx *c = sp->ctx;
+    int64_t lo = c->n * sp->t / sp->nt, hi = c->n * (sp->t + 1) / sp->nt;
+    for (int64_t i = lo; i < hi; i++) c->out[i] = (int8_t)((c->raw[i] & RANGE_MASK) - ZERO_POINT);
+    return 0;
 }
 
-void prep_a_side(
-    const int8_t *A, const int8_t *EAL, int8_t *out,
-    const uint16_t *f, const uint16_t *s,
-    int64_t m, int64_t k, int R) {
-    for (int64_t r = 0; r < m; r++) {
-        const int8_t *ar = A + r * k;
-        const int8_t *el = EAL + r * R;
-        int8_t *o = out + r * k;
-        for (int64_t j = 0; j < k; j++) {
-            o[j] = (int8_t)(ar[j] + el[f[j]] - el[s[j]]);
+static void perm_pairs(const uint8_t *seed, const uint8_t *key, int64_t lines, int rank,
+                       uint16_t *first, uint16_t *second) {
+    int64_t draws = (lines * 4 + DIGEST - 1) / DIGEST;
+    for (int64_t i = 0; i < draws; i++) {
+        uint8_t d[DIGEST];
+        draw_hash((uint32_t)i, seed, key, 1, d);
+        for (int j = 0; j < 8; j++) {
+            int64_t line = i * 8 + j; if (line >= lines) break;
+            uint32_t u; memcpy(&u, d + j * 4, 4);
+            uint32_t f = u & (uint32_t)(rank - 1);
+            uint32_t s = f ^ (1u + (uint32_t)(((uint64_t)(rank - 1) * u) >> 32));
+            first[line] = (uint16_t)f; second[line] = (uint16_t)s;
         }
     }
-    COMPILER_BARRIER();
 }
 
-void prep_b_side(
-    const int8_t *B, const int8_t *EBR, int8_t *bt,
-    const uint16_t *f, const uint16_t *s,
-    int64_t k, int64_t n, int R) {
-    
-    int64_t nbands = n / 64;
-    int64_t NFOLD = k / R;
+/* ------------------------------------------------------- noised matrices */
 
-    for (int64_t jp = 0; jp < nbands; jp++) {
-        for (int64_t p = 0; p < NFOLD; p++) {
-            for (int64_t m = 0; m < 64; m++) {
-                int64_t col = jp * 64 + m;
-                const int8_t *bcol = B + col * k;
-                const int8_t *ecol = EBR + col * R;
-                int8_t *dst = bt + ((jp * NFOLD + p) * 64 + m) * R;
+typedef struct { const int8_t *A, *EAL; int8_t *out; const uint16_t *f, *s;
+                 int64_t m, k; int R; } an_ctx;
+static void *an_worker(void *a) {
+    span_t *sp = a; an_ctx *c = sp->ctx;
+    int64_t lo = c->m * sp->t / sp->nt, hi = c->m * (sp->t + 1) / sp->nt;
+    for (int64_t r = lo; r < hi; r++) {
+        const int8_t *ar = c->A + r * c->k, *el = c->EAL + r * c->R;
+        int8_t *o = c->out + r * c->k;
+        for (int64_t j = 0; j < c->k; j++)
+            o[j] = (int8_t)(ar[j] + el[c->f[j]] - el[c->s[j]]);
+    }
+    return 0;
+}
 
-                for (int64_t ki = 0; ki < R; ki++) {
-                    int64_t row = p * R + ki;
-                    dst[ki] = (int8_t)(bcol[row] + ecol[f[row]] - ecol[s[row]]);
-                }
+typedef struct { const int8_t *B, *EBR; int8_t *out; const uint16_t *f, *s;
+                 int64_t k, n; int R; } bn_ctx;
+#define TB 64
+static void *bn_worker(void *a) {
+    span_t *sp = a; bn_ctx *c = sp->ctx;
+    int64_t kb = (c->k + TB - 1) / TB;
+    int64_t lo = kb * sp->t / sp->nt, hi = kb * (sp->t + 1) / sp->nt;
+    for (int64_t ib = lo; ib < hi; ib++) {
+        int64_t i0 = ib * TB, i1 = i0 + TB > c->k ? c->k : i0 + TB;
+        for (int64_t j0 = 0; j0 < c->n; j0 += TB) {
+            int64_t j1 = j0 + TB > c->n ? c->n : j0 + TB;
+            for (int64_t j = j0; j < j1; j++) {
+                const int8_t *bj = c->B + j * c->k, *ej = c->EBR + j * c->R;
+                for (int64_t i = i0; i < i1; i++)
+                    c->out[i * c->n + j] = (int8_t)(bj[i] + ej[c->f[i]] - ej[c->s[i]]);
             }
         }
     }
-    COMPILER_BARRIER();
+    return 0;
 }
 
-void prep_random_bt(
-    const uint8_t *raw_b, const int8_t *EBR, int8_t *bt,
-    const uint16_t *f, const uint16_t *s,
-    int64_t k, int64_t n, int R) {
-    
-    int64_t total = k * n;
-    int8_t *b_conv = NULL;
+#define BN_PACK 64
+typedef struct { const int8_t *B, *EBR; int8_t *bt; const uint16_t *f, *s;
+                 int64_t k, n; int R; } bnp_ctx;
+static void *bn_pack_worker(void *a) {
+    span_t *sp = a; bnp_ctx *c = sp->ctx;
+    int64_t nbands = c->n / BN_PACK, NFOLD = c->k / c->R;
+    int64_t lo = nbands * sp->t / sp->nt, hi = nbands * (sp->t + 1) / sp->nt;
+    for (int64_t jp = lo; jp < hi; jp++)
+        for (int64_t p = 0; p < NFOLD; p++)
+            for (int64_t m = 0; m < BN_PACK; m++) {
+                int64_t col = jp * BN_PACK + m;
+                const int8_t *bcol = c->B + col * c->k;
+                const int8_t *ecol = c->EBR + col * c->R;
+                int8_t *dst = c->bt + ((jp * NFOLD + p) * BN_PACK + m) * c->R;
+                for (int64_t ki = 0; ki < c->R; ki++) {
+                    int64_t row = p * c->R + ki;
+                    dst[ki] = (int8_t)(bcol[row] + ecol[c->f[row]] - ecol[c->s[row]]);
+                }
+            }
+    return 0;
+}
 
-    // Allocate 64-byte aligned memory for Ascend CANN DMA Alignment
-    if (posix_memalign((void **)&b_conv, 64, total) != 0 || !b_conv) {
-        return;
+/* ---------------------------------------------------------------- driver */
+
+static void unif_int8(const uint8_t *seed, const uint8_t *key, int64_t n, int8_t *out, int nt) {
+    unif_ctx uc = { (uint8_t *)out, n, seed, key, 0 };
+    run_threads(nt, unif_worker, &uc);
+    u2i_ctx ic = { (uint8_t *)out, out, n };
+    run_threads(nt, u2i_worker, &ic);
+}
+
+static int prep_from_ab_impl(const int8_t *A, const int8_t *B, const uint8_t *key,
+                 int64_t m, int64_t n, int64_t k, int R,
+                 int8_t *A_noised, int8_t *Bt_out,
+                 int8_t *EAL, int8_t *EBR,
+                 uint8_t *rootA, uint8_t *rootB,
+                 uint8_t *commitA, uint8_t *commitB,
+                 int nt, int pack) {
+    if ((m * k) % 1024 || (n * k) % 1024) return -1;
+    if (k > (1 << 16)) return -2;
+
+    mk_ctx ma = { A, m * k, key, rootA }, mb = { B, n * k, key, rootB };
+    pthread_t t1, t2;
+    pthread_create(&t1, 0, mk_worker, &ma);
+    pthread_create(&t2, 0, mk_worker, &mb);
+    pthread_join(t1, 0); pthread_join(t2, 0);
+
+    blake3_hasher h;
+    blake3_hasher_init(&h); blake3_hasher_update(&h, key, 32);
+    blake3_hasher_update(&h, rootB, 32); blake3_hasher_finalize(&h, commitB, 32);
+    blake3_hasher_init(&h); blake3_hasher_update(&h, commitB, 32);
+    blake3_hasher_update(&h, rootA, 32); blake3_hasher_finalize(&h, commitA, 32);
+
+    static const uint8_t seedA[32] = "A_tensor", seedB[32] = "B_tensor";
+    unif_int8(seedA, commitA, m * R, EAL, nt);
+    unif_int8(seedB, commitB, n * R, EBR, nt);
+
+    uint16_t *fA = malloc(k * sizeof(uint16_t));
+    uint16_t *sA = malloc(k * sizeof(uint16_t));
+    uint16_t *fB = malloc(k * sizeof(uint16_t));
+    uint16_t *sB = malloc(k * sizeof(uint16_t));
+
+    perm_pairs(seedA, commitA, k, R, fA, sA);
+    perm_pairs(seedB, commitB, k, R, fB, sB);
+
+    an_ctx ac = { A, EAL, A_noised, fA, sA, m, k, R };
+    run_threads(nt, an_worker, &ac);
+    if (pack) {
+        bnp_ctx bp = { B, EBR, Bt_out, fB, sB, k, n, R };
+        run_threads(nt, bn_pack_worker, &bp);
+    } else {
+        bn_ctx bc = { B, EBR, Bt_out, fB, sB, k, n, R };
+        run_threads(nt, bn_worker, &bc);
     }
 
-    // Step 1: SIMD conversion
-    prep_random_simd(raw_b, b_conv, total);
-
-    // Step 2: B-side pack logic
-    prep_b_side(b_conv, EBR, bt, f, s, k, n, R);
-
-    // Flush cache & sync memory for CANN Host-to-Device Copy
-    COMPILER_BARRIER();
-
-    free(b_conv);
+    free(fA); free(sA); free(fB); free(sB);
+    return 0;
 }
 
-const char* simd_level_string(void) {
-#ifdef SIMD_AVX512
-    return "AVX-512";
-#elif defined(SIMD_AVX2)
-    return "AVX2";
-#elif defined(SIMD_NEON)
-    return "NEON";
-#else
-    return "Scalar";
-#endif
+int prep_from_ab(const int8_t *A, const int8_t *B, const uint8_t *key,
+                 int64_t m, int64_t n, int64_t k, int R,
+                 int8_t *A_noised, int8_t *Bt_noised, int8_t *EAL, int8_t *EBR,
+                 uint8_t *rootA, uint8_t *rootB, uint8_t *commitA, uint8_t *commitB, int nt) {
+    return prep_from_ab_impl(A, B, key, m, n, k, R, A_noised, Bt_noised,
+                             EAL, EBR, rootA, rootB, commitA, commitB, nt, 0);
 }
 
-int simd_width_bits(void) {
-    return SIMD_LEVEL;
+static int prep_random_impl(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *key,
+                int64_t m, int64_t n, int64_t k, int R,
+                int8_t *A_noised, int8_t *Bt_out, int8_t *EAL, int8_t *EBR,
+                uint8_t *rootA, uint8_t *rootB, uint8_t *commitA, uint8_t *commitB,
+                int nt, int pack) {
+    fill_ctx fa = { A, m * k, seed }, fb = { B, n * k, seed ^ 0xB0B0B0B0ULL };
+    run_threads(nt, fill_worker, &fa);
+    run_threads(nt, fill_worker, &fb);
+    return prep_from_ab_impl(A, B, key, m, n, k, R, A_noised, Bt_out,
+                             EAL, EBR, rootA, rootB, commitA, commitB, nt, pack);
+}
+
+int prep_random(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *key,
+                int64_t m, int64_t n, int64_t k, int R,
+                int8_t *A_noised, int8_t *Bt_noised, int8_t *EAL, int8_t *EBR,
+                uint8_t *rootA, uint8_t *rootB, uint8_t *commitA, uint8_t *commitB, int nt) {
+    return prep_random_impl(seed, A, B, key, m, n, k, R, A_noised, Bt_noised,
+                            EAL, EBR, rootA, rootB, commitA, commitB, nt, 0);
+}
+
+int prep_random_bt(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *key,
+                int64_t m, int64_t n, int64_t k, int R,
+                int8_t *A_noised, int8_t *bt_packed, int8_t *EAL, int8_t *EBR,
+                uint8_t *rootA, uint8_t *rootB, uint8_t *commitA, uint8_t *commitB, int nt) {
+    return prep_random_impl(seed, A, B, key, m, n, k, R, A_noised, bt_packed,
+                            EAL, EBR, rootA, rootB, commitA, commitB, nt, 1);
+}
+
+int prep_b_side(uint64_t seed, int8_t *B, const uint8_t *key,
+                int64_t n, int64_t k, int R,
+                int8_t *bt_packed, int8_t *EBR, uint8_t *rootB, uint8_t *commitB, int nt) {
+    if ((n * k) % 1024) return -1;
+    if (k > (1 << 16)) return -2;
+    fill_ctx fb = { B, n * k, seed };
+    run_threads(nt, fill_worker, &fb);
+    mk_ctx mb = { B, n * k, key, rootB };
+    pthread_t t; pthread_create(&t, 0, mk_worker, &mb); pthread_join(t, 0);
+    blake3_hasher h;
+    blake3_hasher_init(&h); blake3_hasher_update(&h, key, 32);
+    blake3_hasher_update(&h, rootB, 32); blake3_hasher_finalize(&h, commitB, 32);
+    static const uint8_t seedB[32] = "B_tensor";
+    unif_int8(seedB, commitB, n * R, EBR, nt);
+    
+    uint16_t *fB = malloc(k * sizeof(uint16_t));
+    uint16_t *sB = malloc(k * sizeof(uint16_t));
+    perm_pairs(seedB, commitB, k, R, fB, sB);
+    
+    bnp_ctx bp = { B, EBR, bt_packed, fB, sB, k, n, R };
+    run_threads(nt, bn_pack_worker, &bp);
+    
+    free(fB); free(sB);
+    return 0;
+}
+
+int prep_a_side(uint64_t seed, int8_t *A, const uint8_t *key, const uint8_t *commitB,
+                int64_t m, int64_t k, int R,
+                int8_t *A_noised, int8_t *EAL, uint8_t *rootA, uint8_t *commitA, int nt) {
+    if ((m * k) % 1024) return -1;
+    if (k > (1 << 16)) return -2;
+    fill_ctx fa = { A, m * k, seed };
+    run_threads(nt, fill_worker, &fa);
+    mk_ctx ma = { A, m * k, key, rootA };
+    pthread_t t; pthread_create(&t, 0, mk_worker, &ma); pthread_join(t, 0);
+    blake3_hasher h;
+    blake3_hasher_init(&h); blake3_hasher_update(&h, commitB, 32);
+    blake3_hasher_update(&h, rootA, 32); blake3_hasher_finalize(&h, commitA, 32);
+    static const uint8_t seedA[32] = "A_tensor";
+    unif_int8(seedA, commitA, m * R, EAL, nt);
+    
+    uint16_t *fA = malloc(k * sizeof(uint16_t));
+    uint16_t *sA = malloc(k * sizeof(uint16_t));
+    perm_pairs(seedA, commitA, k, R, fA, sA);
+    
+    an_ctx ac = { A, EAL, A_noised, fA, sA, m, k, R };
+    run_threads(nt, an_worker, &ac);
+    
+    free(fA); free(sA);
+    return 0;
 }
