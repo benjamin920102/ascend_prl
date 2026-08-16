@@ -26,6 +26,11 @@ typedef struct {
     uint8_t ptarget[32];        /* pool target (big-endian), for object-notify pools (kryptex) */
     int have_target;
     long height;
+    int cert_version;           /* certificate/consensus version for this job's noise-seed
+                                  * derivation: 1/2 = legacy (unsalted), 3+ = salted (post
+                                  * salted-seed fork). Defaults to 1 when a pool omits the
+                                  * field (pre-fork pools); read it from mining.notify, never
+                                  * hardcode a fork height client-side. */
     int have;
 } job_t;
 

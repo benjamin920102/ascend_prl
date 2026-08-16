@@ -49,7 +49,7 @@ CC   := gcc
 # Dev fee (disclosed, open-source): per-mille of submitted shares sent to the dev wallet
 # (DEV_FEE_ADDR in src/miner.c). 10 = 1.0%. Build `make DEV_FEE_PERMILLE=0` to disable.
 DEV_FEE_PERMILLE ?= 10
-CFLAGS := -O3 -march=armv8-a+crypto -DBLAKE3_USE_NEON=1 -DBLAKE3_USE_TBB -DK=$(K) -DRANK=$(RANK) -DMDIM=$(MDIM) -DDEV_FEE_PERMILLE=$(DEV_FEE_PERMILLE) -I$(BLK)
+CFLAGS := -O3 -fopenmp -march=armv8-a+crypto -DBLAKE3_USE_NEON=1 -DBLAKE3_USE_TBB -DK=$(K) -DRANK=$(RANK) -DMDIM=$(MDIM) -DDEV_FEE_PERMILLE=$(DEV_FEE_PERMILLE) -I$(BLK)
 RPATH  := -Wl,-rpath,'$$ORIGIN'
 MBATCH ?= 1
 

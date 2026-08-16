@@ -25,6 +25,7 @@ void pool_conn_init(pool_conn_t *c, const char *tag) {
     c->tag = tag;
     c->gzip = 0;
     c->job.have = 0;
+    c->job.cert_version = 1;   /* legacy default until the first mining.notify sets it */
     pthread_mutex_init(&c->send_mu, 0);
 }
 

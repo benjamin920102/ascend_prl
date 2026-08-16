@@ -63,11 +63,14 @@ static int k_open(pool_conn_t *c, const char *host, int port,
 }
 
 static void k_handle_notify(pool_conn_t *c, const char *line) {
-    /* params is an OBJECT: {header, height, job_id, target} */
+    /* params is an OBJECT: {header, height, job_id, target[, cert_version]}.
+     * cert_version is read defensively (defaults to 1) in case this pool adds it later,
+     * same as k1 -- see docs/salted-seed-fork-upgrade-guide.md upstream. */
     char jid[JOBLEN], hdr[2 * HDRLEN], tgt[80];
     if (jstr(line, "header", hdr, sizeof hdr)) return;
     if (jstr(line, "job_id", jid, sizeof jid)) return;
     long height = (long)jnum(line, "height", 0);
+    int cert_version = (int)jnum(line, "cert_version", 1);
     uint8_t ptarget[32]; int have_t = 0;
     if (!jstr(line, "target", tgt, sizeof tgt)) {
         memset(ptarget, 0, 32);
@@ -82,6 +85,7 @@ static void k_handle_notify(pool_conn_t *c, const char *line) {
     strncpy(c->job.job_id, jid, JOBLEN - 1);
     c->job.header_len = (size_t)hex2bin(hdr, c->job.header, HDRLEN);
     c->job.height = height;
+    c->job.cert_version = cert_version;
     if (have_t) { memcpy(c->job.ptarget, ptarget, 32); c->job.have_target = 1; }
     c->job.have = 1;
     pthread_mutex_unlock(&job_mu);

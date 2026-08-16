@@ -44,18 +44,18 @@ extern void pearl_set_bt_slot(const int8_t *bt, int slot) __attribute__((weak));
 extern int prep_random(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *key,
                        int64_t m, int64_t n, int64_t k, int rank,
                        int8_t *An, int8_t *Btn, int8_t *EAL, int8_t *EBR,
-                       uint8_t *rA, uint8_t *rB, uint8_t *cA, uint8_t *cB, int nt);
+                       uint8_t *rA, uint8_t *rB, uint8_t *cA, uint8_t *cB, int nt, int cert_version);
 extern int prep_random_bt(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *key,
                        int64_t m, int64_t n, int64_t k, int rank,
                        int8_t *An, int8_t *bt_packed, int8_t *EAL, int8_t *EBR,
-                       uint8_t *rA, uint8_t *rB, uint8_t *cA, uint8_t *cB, int nt);
+                       uint8_t *rA, uint8_t *rB, uint8_t *cA, uint8_t *cB, int nt, int cert_version);
 /* reuse-B split — B-side cached per job, A-side regenerated per iter. */
 extern int prep_b_side(uint64_t seed, int8_t *B, const uint8_t *key,
                        int64_t n, int64_t k, int rank,
-                       int8_t *bt_packed, int8_t *EBR, uint8_t *rootB, uint8_t *commitB, int nt);
+                       int8_t *bt_packed, int8_t *EBR, uint8_t *rootB, uint8_t *commitB, int nt, int cert_version);
 extern int prep_a_side(uint64_t seed, int8_t *A, const uint8_t *key, const uint8_t *commitB,
                        int64_t m, int64_t k, int rank,
-                       int8_t *An, int8_t *EAL, uint8_t *rootA, uint8_t *commitA, int nt);
+                       int8_t *An, int8_t *EAL, uint8_t *rootA, uint8_t *commitA, int nt, int cert_version);
 extern int scan_full(const int8_t *an, int nstrips, const uint8_t *key, const uint32_t *tgt,
                      int nbands, int n_hi, int pow_threads, uint32_t *scratch,
                      int *hs, int *ht);
@@ -144,6 +144,10 @@ typedef struct {
     char job_id[JOBLEN];
     double diff;
     uint8_t ptarget[32];
+    int cert_version;     /* consensus version captured at prep time, so it always matches
+                            * the roots/commits this bundle was salted with (see bundle_key
+                            * / prep_worker: read once, from the job that keyed this bundle,
+                            * not re-read at submit time). */
     int slot;            /* this bundle's device B-buffer slot (0/1, = bun[] index) */
 } bundle_t;
 static void bundle_key(bundle_t *b);
@@ -165,6 +169,7 @@ static struct {
     uint8_t key[32], commitB[32], rootB[32];
     char job_id[JOBLEN];
     double diff; uint8_t ptarget[32];
+    int cert_version;
     int slot, valid; long since;
 } bs;
 /* (main thread, between scans) rebuild the B-side iff the job changed or the refresh interval
@@ -176,13 +181,15 @@ static int ensure_bside(long N, long Kc, int rank, int prep_n) {
     int jobchg = !bs.valid || strncmp(bs.job_id, g_job->job_id, JOBLEN - 1);
     char jid[JOBLEN]; strncpy(jid, g_job->job_id, JOBLEN - 1); jid[JOBLEN - 1] = 0;
     double diff = g_job->difficulty; uint8_t pt[32]; memcpy(pt, g_job->ptarget, 32);
+    int cert_version = g_job->cert_version;
     static uint8_t hdr[HDRLEN]; size_t hl = g_job->header_len; memcpy(hdr, g_job->header, hl);
     pthread_mutex_unlock(&job_mu);
     if (!(jobchg || (refresh > 0 && bs.since >= refresh))) return 0;
     strncpy(bs.job_id, jid, JOBLEN - 1); bs.diff = diff; memcpy(bs.ptarget, pt, 32);
+    bs.cert_version = cert_version;
     hash_key(hdr, hl, (size_t)Kc, (size_t)rank, mp.rows, mp.nrows, mp.cols, mp.ncols, bs.key);
     uint64_t seed = ((uint64_t)rand() << 32) ^ (uint64_t)time(0) ^ 0xB5B5ULL;
-    prep_b_side(seed, bs.B, bs.key, N, Kc, rank, bs.bt, bs.EBR, bs.rootB, bs.commitB, prep_n);
+    prep_b_side(seed, bs.B, bs.key, N, Kc, rank, bs.bt, bs.EBR, bs.rootB, bs.commitB, prep_n, cert_version);
     if (pearl_set_bt_slot)     pearl_set_bt_slot(bs.bt, 0);          /* single device slot 0 */
     else if (pearl_set_b_slot) pearl_set_b_slot(bs.bt, (int)N, 0);
     bs.slot = 0; bs.valid = 1; bs.since = 0;
@@ -197,8 +204,10 @@ static void *prep_worker(void *p) {
         uint64_t seed = ((uint64_t)rand() << 32) ^ (uint64_t)time(0);
         strncpy(b->job_id, bs.job_id, JOBLEN - 1);
         b->diff = bs.diff; memcpy(b->ptarget, bs.ptarget, 32); memcpy(b->key, bs.key, 32);
+        b->cert_version = bs.cert_version;
         prep_a_side(seed, b->A, bs.key, bs.commitB, mp.m, mp.k, (int)mp.rank,
-                    b->An, g_EAL, b->roots[0] /*rootA*/, b->roots[2] /*commitA = PoW key*/, prep_n);
+                    b->An, g_EAL, b->roots[0] /*rootA*/, b->roots[2] /*commitA = PoW key*/, prep_n,
+                    bs.cert_version);
         clock_gettime(CLOCK_MONOTONIC, &pb);
         g_last_prep_ms = (pb.tv_sec - pa.tv_sec) * 1000 + (pb.tv_nsec - pa.tv_nsec) / 1000000;
         return 0;
@@ -227,11 +236,11 @@ static void *prep_worker(void *p) {
     if (pearl_set_bt_slot) {
         prep_random_bt(seed, b->A, b->B, b->key, mp.m, mp.n, mp.k, (int)mp.rank,
                        b->An, b->Btn, b->EAL, b->EBR,
-                       b->roots[0], b->roots[1], b->roots[2], b->roots[3], prep_n);
+                       b->roots[0], b->roots[1], b->roots[2], b->roots[3], prep_n, b->cert_version);
     } else {
         prep_random(seed, b->A, b->B, b->key, mp.m, mp.n, mp.k, (int)mp.rank,
                     b->An, b->Btn, b->EAL, b->EBR,
-                    b->roots[0], b->roots[1], b->roots[2], b->roots[3], prep_n);
+                    b->roots[0], b->roots[1], b->roots[2], b->roots[3], prep_n, b->cert_version);
     }
     clock_gettime(CLOCK_MONOTONIC, &pb);
     g_last_prep_ms = (pb.tv_sec - pa.tv_sec) * 1000 + (pb.tv_nsec - pa.tv_nsec) / 1000000;
@@ -244,6 +253,7 @@ static void bundle_key(bundle_t *b) {
     pthread_mutex_lock(&job_mu);
     strncpy(b->job_id, g_job->job_id, JOBLEN - 1);
     b->diff = g_job->difficulty;
+    b->cert_version = g_job->cert_version;
     memcpy(b->ptarget, g_job->ptarget, 32);
     hash_key(g_job->header, g_job->header_len, (size_t)mp.k, (size_t)mp.rank,
              mp.rows, mp.nrows, mp.cols, mp.ncols, b->key);
@@ -391,9 +401,10 @@ int main(int argc, char **argv) {
                 /* B changed -> cur->An used the old commitB; re-prep cur's A-side to match */
                 uint64_t s = ((uint64_t)rand() << 32) ^ (uint64_t)time(0) ^ 0xA5A5ULL;
                 prep_a_side(s, cur->A, bs.key, bs.commitB, mp.m, mp.k, (int)mp.rank,
-                            cur->An, g_EAL, cur->roots[0], cur->roots[2], prep_n);
+                            cur->An, g_EAL, cur->roots[0], cur->roots[2], prep_n, bs.cert_version);
                 strncpy(cur->job_id, bs.job_id, JOBLEN - 1);
                 cur->diff = bs.diff; memcpy(cur->ptarget, bs.ptarget, 32); memcpy(cur->key, bs.key, 32);
+                cur->cert_version = bs.cert_version;
             }
             bs.since++;
         }
