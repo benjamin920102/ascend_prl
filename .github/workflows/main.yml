@@ -1,0 +1,67 @@
+name: Build and Pre-release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ make cmake git curl clang pkg-config wget
+
+      - name: Download Pearl Dependencies
+        run: |
+          sudo mkdir -p /root/pearl-rust
+          TEMP_DIR=$(mktemp -d)
+          git clone --depth 1 https://github.com/pearl-research-labs/pearl.git "$TEMP_DIR/pearl"
+          sudo cp -r "$TEMP_DIR/pearl/." /root/pearl-rust/
+          rm -rf "$TEMP_DIR"
+          sudo ls -la /root/pearl-rust/
+
+      - name: Download and Install Ascend CANN Toolkit
+        run: |
+          wget -q https://ascend.devcloud.huaweicloud.com/artifactory/cann-run-mirror/software/legacy/20260422000325096/Ascend-cann-toolkit_9.0.0_linux-aarch64.run
+          chmod +x Ascend-cann-toolkit_9.0.0_linux-aarch64.run
+          bash ./Ascend-cann-toolkit_9.0.0_linux-aarch64.run --install --quiet
+          sudo su -c "
+            rustup default stable
+          "
+
+      - name: Setup BLAKE3 Vendor Path for Makefile
+        run: |
+          sudo mkdir -p /root/.cargo/registry/src/github.com-1ecc6299db9ec823/blake3-1.5.0/c
+          git clone --depth 1 https://github.com/BLAKE3-team/BLAKE3.git /tmp/blake3_repo
+          sudo cp -r /tmp/blake3_repo/c/. /root/.cargo/registry/src/github.com-1ecc6299db9ec823/blake3-1.5.0/c/
+          rm -rf /tmp/blake3_repo
+
+      - name: Build Project
+        run: |
+          sudo su -c "
+            source /home/runner/Ascend/cann/set_env.sh
+            make RANK=128
+          "
+
+      - name: Package Build Output
+        run: |
+          sudo tar -czvf build-aarch64.tar.gz -C build .
+
+      - name: Create Pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: pre-release-${{ github.run_number }}
+          name: Pre-release Build #${{ github.run_number }}
+          prerelease: true
+          files: build-aarch64.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
