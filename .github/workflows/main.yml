@@ -49,7 +49,7 @@ jobs:
         run: |
           sudo su -c "
             source /home/runner/Ascend/cann/set_env.sh
-            make RANK=128
+            make RANK=128 MBATCH=2
           "
 
       - name: Package Build Output
