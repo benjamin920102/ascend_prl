@@ -37,25 +37,28 @@ static void k_init_params(mining_params_t *mp) {
 
 static int k_open(pool_conn_t *c, const char *host, int port,
                   const char *addr, const char *worker, const char *pass, mining_params_t *mp) {
-    (void)pass;
     c->gzip = 0;                 /* clear any flag from a prior session before re-negotiating */
     if (pool_connect(c, host, port)) return -1;
     char line[LINE];
     snprintf(line, LINE, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"cminer/0.1\"]}");
     pool_send_line(c, line);
-    /* authorize with the v2 object params -> ask for gzip. If the pool echoes "type":"v2" in the
+    /* password: pass through as-is for custom share difficulty (e.g. "d=2097152" or "d=349245965").
+     * Empty / missing -> pool default. See https://gist.github.com/maxmalysh/f4c29f532e650a114b317e234f1393fb
+     * authorize with the v2 object params -> ask for gzip. If the pool echoes "type":"v2" in the
      * ack (k_dispatch), c->gzip is set and submits go out gzipped. A pool that ignores "type"
      * (replies without it) just keeps c->gzip=0 -> plain proof, so this stays back-compatible.
      * A v2 session REQUIRES gzip submits (the pool gunzips), so PRL_NOGZIP must negotiate a true
      * v1 session (no "type") — else a plain payload in a v2 session is rejected as "Invalid share".
      * PRL_GZIP forces gzip without waiting for the ack. */
-    if (getenv("PRL_NOGZIP"))    /* explicit v1: original array-form authorize, plain proof */
-        snprintf(line, LINE, "{\"id\":3,\"method\":\"mining.authorize\",\"params\":[\"%s.%s\",\"x\"]}",
-                 addr, worker);
-    else
+    const char *pw = (pass && *pass) ? pass : "";
+    if (getenv("PRL_NOGZIP")) {  /* explicit v1: original array-form authorize, plain proof */
+        snprintf(line, LINE, "{\"id\":3,\"method\":\"mining.authorize\",\"params\":[\"%s.%s\",\"%s\"]}",
+                 addr, worker, pw[0] ? pw : "x");
+    } else {
         snprintf(line, LINE, "{\"id\":3,\"method\":\"mining.authorize\",\"params\":"
-                 "{\"wallet\":\"%s.%s\",\"agent\":\"cminer/0.1\",\"type\":\"v2\"}}",
-                 addr, worker);
+                 "{\"wallet\":\"%s.%s\",\"agent\":\"cminer/0.1\",\"password\":\"%s\",\"type\":\"v2\"}}",
+                 addr, worker, pw);
+    }
     pool_send_line(c, line);
     if (getenv("PRL_GZIP") && !getenv("PRL_NOGZIP")) c->gzip = 1;
     pool_start_reader(c, mp);

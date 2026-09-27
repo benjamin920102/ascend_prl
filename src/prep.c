@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <omp.h>
 #include "blake3.h"
@@ -95,21 +96,43 @@ static void draw_hash(uint32_t idx, const uint8_t *seed, const uint8_t *key,
     blake3_hasher_finalize(&h, out, DIGEST);
 }
 
+/* Fill A/B matrices. Default (required for effective gzip v2) is a highly repetitive pattern so
+ * plain_proof compresses ~10-100x. Uniform random data is essentially incompressible.
+ * See https://gist.github.com/maxmalysh/eaaf4332dbc5ca99d0a78f24a733fffe
+ *
+ * PRL_ZERO_SEED=0  -> legacy uniform random fill (incompressible proofs)
+ * PRL_ZERO_SEED unset / any other value -> zero-fill + 8-byte seed stamp (default, gzippable)
+ *
+ * Zero + seed stamp keeps each prep distinct (different root/commit/noise → different C) while
+ * the vast majority of merkle leaf bytes are identical zeros — gzip loves that. */
 static void fill_buf(int8_t *buf, int64_t total, uint64_t seed, int nt) {
+    const char *zs = getenv("PRL_ZERO_SEED");
+    if (zs && zs[0] == '0' && zs[1] == '\0') {
+        /* legacy random path */
 #pragma omp parallel num_threads(nt)
-    {
-        int t = omp_get_thread_num();
-        int num_t = omp_get_num_threads();
-        int64_t lo = total * t / num_t, hi = total * (t + 1) / num_t;
-        rng_t r;
-        rng_seed(&r, seed + 0x9E37 * (uint64_t)(t + 1));
-        int64_t i = lo;
-        while (i < hi) {
-            uint64_t v = rng_next(&r);
-            for (int b = 0; b < 8 && i < hi; b++, v >>= 8)
-                buf[i++] = (int8_t)((uint8_t)v % 127) - 63;
+        {
+            int t = omp_get_thread_num();
+            int num_t = omp_get_num_threads();
+            int64_t lo = total * t / num_t, hi = total * (t + 1) / num_t;
+            rng_t r;
+            rng_seed(&r, seed + 0x9E37 * (uint64_t)(t + 1));
+            int64_t i = lo;
+            while (i < hi) {
+                uint64_t v = rng_next(&r);
+                for (int b = 0; b < 8 && i < hi; b++, v >>= 8)
+                    buf[i++] = (int8_t)((uint8_t)v % 127) - 63;
+            }
         }
+        return;
     }
+    /* gzippable path: long zero runs + unique seed stamp so roots still differ per prep */
+    memset(buf, 0, (size_t)total);
+    if (total >= 8) {
+        uint64_t s = seed;
+        for (int i = 0; i < 8; i++, s >>= 8)
+            buf[i] = (int8_t)(s & 0xff);
+    }
+    (void)nt;
 }
 
 static void calc_mk(const int8_t *buf, int64_t len, const uint8_t *key, uint8_t *root) {

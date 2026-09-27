@@ -105,13 +105,42 @@ Our kernel reaches ~30 TH/s/device at rank=256 end-to-end (silicone peak 32TH/s 
 
 > Note that **Ascend 310** and **950** do not have these limitations and can (theoretically) reach closer to hardware peak TOP/s.
 
+## GZIP v2 + custom share difficulty (Kryptex)
+
+Network traffic for share submits is reduced **~80–100×** by the Pearl stratum gzip protocol
+([spec](https://gist.github.com/maxmalysh/eaaf4332dbc5ca99d0a78f24a733fffe)):
+
+1. `mining.authorize` sends `"type":"v2"`. When the pool echoes `"type":"v2"`, the miner submits
+   `base64(gzip(bincode(plain_proof)))` instead of the ~136 KB plain base64 proof (~15 KB compressed).
+2. Matrix A/B are **zero-seeded** by default (plus an 8-byte seed stamp) so the proof is highly
+   repetitive and actually compresses. Uniform random data does not. Override with `PRL_ZERO_SEED=0`
+   only if you need the legacy random fill.
+
+**Custom share difficulty** ([spec](https://gist.github.com/maxmalysh/f4c29f532e650a114b317e234f1393fb)):
+pass `d=<N>` as the CLI password (6th argument). Example for a high-hashrate worker targeting
+~1 share / 30 s:
+
+```bash
+./ascend_prl_kryptex 0 worker pool.kryptex.com 7000 prl1...your_wallet 'd=349245965'
+```
+
+Empty password → pool default (`d=2097152` ≈ 9000 TH). Formula:
+`d = hashrate_H/s × target_share_seconds / 4_294_967_296`.
+
+| Env | Meaning |
+| --- | ------- |
+| `PRL_NOGZIP` | Force v1 (no `"type":"v2"`, plain proofs) |
+| `PRL_GZIP` | Assume gzip without waiting for the authorize ack |
+| `PRL_ZERO_SEED=0` | Legacy random A/B fill (incompressible; not recommended) |
+| `PRL_GZIP_FIELD` | Override submit field name (default still `plain_proof`) |
+
 ## Pool compatibility
 
 Currently tested against these pools:
 
 | Pool | Notes|
 | --- | --- |
-| `kryptex` | recommended |
+| `kryptex` | recommended; gzip v2 + custom `d=` difficulty |
 
 A new pool that speaks plain stratum will most likely work via the `kryptex` path; if not, open an issue with a capture and it's usually a small handshake/parse tweak. I will try to add pools on request.
 

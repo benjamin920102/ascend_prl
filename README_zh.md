@@ -110,13 +110,40 @@ k 增大会拉长区块处理时间，从而提高产生孤块的概率。实际
 
 > 注意：**昇腾 310** 和 **950** 没有上述限制，理论上可以更接近硬件峰值 TOP/s。
 
+## GZIP v2 + 自定义份额难度（Kryptex）
+
+通过 Pearl stratum gzip 协议，提交份额的网络流量可降低约 **80–100 倍**
+（[协议说明](https://gist.github.com/maxmalysh/eaaf4332dbc5ca99d0a78f24a733fffe)）：
+
+1. `mining.authorize` 发送 `"type":"v2"`。矿池在应答中回显 `"type":"v2"` 后，矿工提交
+   `base64(gzip(bincode(plain_proof)))`，而不是约 136 KB 的明文 base64 证明（压缩后约 15 KB）。
+2. 矩阵 A/B **默认以零填充**（外加 8 字节 seed 戳），使证明高度可重复、真正可被 gzip 压缩。
+   均匀随机数据几乎压不动。仅在需要旧版随机填充时设置 `PRL_ZERO_SEED=0`。
+
+**自定义份额难度**（[说明](https://gist.github.com/maxmalysh/f4c29f532e650a114b317e234f1393fb)）：
+把 CLI 第 6 个参数（password）设为 `d=<N>`。例如高算力矿机目标约每 30 秒一个份额：
+
+```bash
+./ascend_prl_kryptex 0 worker pool.kryptex.com 7000 prl1...你的钱包 'd=349245965'
+```
+
+password 为空 → 使用矿池默认（`d=2097152` ≈ 9000 TH）。公式：
+`d = 算力_H/s × 目标份额间隔秒数 / 4_294_967_296`。
+
+| 环境变量 | 含义 |
+| --- | --- |
+| `PRL_NOGZIP` | 强制 v1（不发 `"type":"v2"`，明文证明） |
+| `PRL_GZIP` | 不等 authorize 应答就假定启用 gzip |
+| `PRL_ZERO_SEED=0` | 旧版随机 A/B 填充（不可压缩，不推荐） |
+| `PRL_GZIP_FIELD` | 覆盖 submit 字段名（默认仍为 `plain_proof`） |
+
 ## 矿池兼容性
 
 目前已测试过的矿池：
 
 | 矿池 | 备注 |
 | --- | --- |
-| `kryptex` | 推荐 |
+| `kryptex` | 推荐；支持 gzip v2 + 自定义 `d=` 难度 |
 
 只要是讲标准 stratum 协议的新矿池，大概率走 `kryptex` 路径就能用；如果不行，请附上一段抓包
 开一个 issue，通常只需要对握手/解析做一点小调整。我会按需添加矿池支持。
