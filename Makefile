@@ -9,19 +9,15 @@
 #   build/libpearl_hlc2.so    Ascend-C GEMM+fold+transcript kernel (cmake, see kernel/)
 #   build/libpearl_proof.so   Rust PlainProof FFI (cargo, see proof-ffi/)
 #
-# Rank select:  make RANK=128   (K=4096)
-#               make RANK=1024  (escapes the HBM wall, K=16384 — see README)
+# Rank select:  make RANK=128   (K=4096, pool-supported default)
+#               make RANK=1024  (custom/non-pool experiments — see README)
 
-# Production: RANK=256 K=4096 — the cube sweet-spot (MM_K=256 exactly fills
-# L0B) at m=n=16384, with reuse-B hiding prep. See README.
-RANK ?= 256
+RANK ?= 128
 ifeq ($(RANK),512)
   K := 8192
   NINNER := 4
   NFOLD  := 16
 else ifeq ($(RANK),256)
-  # k=4096 is the ONLY legal k at r=256 (16r=4096<=k<=4r^2, pool cap k<=4096). AI=r/8=32,
-  # the max reachable under a k<=4096 pool. MM_K=NINNER*128=256 (half the 512 L0B-fill).
   K := 4096
   NINNER := 2
   NFOLD  := 16

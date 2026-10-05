@@ -81,14 +81,14 @@ PRL_COEXIST_GUARD=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./scripts/launch.s
   请在 `proof-ffi/Cargo.toml` 中把路径改成你本地的检出目录。
 
 ```bash
-make                     # 默认 RANK=256；生成 build/{ascend_prl_kryptex, ascend_prl_k1, libpearl_hlc2.so, libpearl_proof.so}
+make                     # 默认 RANK=128；生成 build/{ascend_prl_kryptex, ascend_prl_k1, libpearl_hlc2.so, libpearl_proof.so}
 ```
 
 编译选项（`make 变量=...`）：
 
 | 选项 | 默认 | 含义 |
 | ---- | ------- | ------- |
-| `RANK` | `256` | 噪声 rank / 算子配置。`256`（K=4096）是实际矿池唯一接受的 rank。 |
+| `RANK` | `128` | 噪声 rank / 算子配置。当前公开矿池只接受 `128`（K=4096）。 |
 | `MDIM` | `16384` | 16384 可让矿池的区块证明（block-proof）足够快，避免产生孤块（orphan）。 |
 | `DEV_FEE_PERMILLE` | `10` | 开发者抽成，按千分比计时（10 = 1%，0 = 关闭）。 |
 | `DEV_FEE_CYCLE_S` | `5400` | 抽成调度周期（秒）；窗口 = 周期×千分比/1000（1% 时 =54 秒）。越大则切换开发者连接的次数越少。 |
@@ -103,10 +103,7 @@ TH/s ~ OP/s / 2 =（内存带宽）×（fold 的算术强度）。我们总共�
 所以硅片理论峰值约为 rank / 8 TH/s。
 
 币种规范允许 r 最高到 1024，但要求 k ≥ r×16，而 ZK 证明的大小与校验时间随 k 线性增长。
-k 增大会拉长区块处理时间，从而提高产生孤块的概率。实际矿池只接受 r=128 或 256。
-
-我们的算子在 rank=256 端到端可达 ~30 TH/s/卡（该形状下硅片峰值约 32 TH/s）。要进一步提升，
-需要自建矿池并设法加速 ZK 证明的构建。如果社区对当前版本有兴趣，我会着手去做。
+k 增大会拉长区块处理时间，从而提高产生孤块的概率。当前公开矿池只接受 r=128。其他 rank 仅保留用于自定义/非公开矿池实验。
 
 > 注意：**昇腾 310** 和 **950** 没有上述限制，理论上可以更接近硬件峰值 TOP/s。
 

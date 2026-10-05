@@ -80,14 +80,14 @@ Requirements:
   `proof-ffi/Cargo.toml` to your checkout.
 
 ```bash
-make                     # default RANK=256; builds build/{ascend_prl_kryptex, ascend_prl_k1, libpearl_hlc2.so, libpearl_proof.so}
+make                     # default RANK=128; builds build/{ascend_prl_kryptex, ascend_prl_k1, libpearl_hlc2.so, libpearl_proof.so}
 ```
 
 Build flags (`make VAR=...`):
 
 | Flag | Default | Meaning |
 | ---- | ------- | ------- |
-| `RANK` | `256` | Noise rank / kernel config. `256` (K=4096) is the only rank real pools accept. |
+| `RANK` | `128` | Noise rank / kernel config. Current public pools accept `128` (K=4096). |
 | `MDIM` | `16384` | 16384 keeps the pool's block-proof fast (non-orphaning). |
 | `DEV_FEE_PERMILLE` | `10` | Dev fee, per-mille of time (10 = 1%, 0 = off). |
 | `DEV_FEE_CYCLE_S` | `5400` | Dev-fee schedule period (s); window = cycle×permille/1000 (=54s @1%). Larger = fewer dev-conn reconnects. |
@@ -99,9 +99,7 @@ Build flags (`make VAR=...`):
 The cube unit can not perform XORs and shifts, and the vector is bad at multiplying matrices. Thus we need to transfer
 each k-partial from cube to vector through L2 (2TB/s aggregated). This limits TH/s ~ OP/s / 2 = (memory bandwidth) * (fold arithmetic intensity). We transfer 8/r bytes in total -> arithmetic intensity = r/8. So the silicone peak TH/s is rank / 8 TH/s.
 
-Coin specs allow r up to 1024, but k >=r * 16, ZK-proof size and check time scales linearly with k. Thin increase block processing time, and therefore - probability of orphan blocks. Real pool accepts only r=128 or 256.  
-
-Our kernel reaches ~30 TH/s/device at rank=256 end-to-end (silicone peak 32TH/s on these shapes). To push it further, one needs to host a pool and somehow speedup the ZK-proof building. I plan to do it if there will be community interest in current version.
+Coin specs allow r up to 1024, but k >=r * 16, ZK-proof size and check time scales linearly with k. Thin increase block processing time, and therefore - probability of orphan blocks. Current public pools accept only r=128. Other ranks are kept only for custom/non-pool experiments.
 
 > Note that **Ascend 310** and **950** do not have these limitations and can (theoretically) reach closer to hardware peak TOP/s.
 
