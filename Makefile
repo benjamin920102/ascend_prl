@@ -18,6 +18,8 @@ ifeq ($(RANK),512)
   NINNER := 4
   NFOLD  := 16
 else ifeq ($(RANK),256)
+  # k=4096 is the ONLY legal k at r=256 (16r=4096<=k<=4r^2, pool cap k<=4096). AI=r/8=32,
+  # the max reachable under a k<=4096 pool. MM_K=NINNER*128=256 (half the 512 L0B-fill).
   K := 4096
   NINNER := 2
   NFOLD  := 16

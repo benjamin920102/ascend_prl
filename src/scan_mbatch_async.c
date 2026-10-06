@@ -1,7 +1,8 @@
 /* M-batch scan with NPU-side BLAKE3+le256: main thread drives submit/wait (NPU) and reads
  * hit result directly from NPU. No CPU PoW worker threads needed - all hashing done on NPU.
  * 
- * Lifecycle: scan_full: reset state, feed jobs, check for hits via NPU hitResult, return.
+ * Lifecycle: scan_full: reset state, feed production-fast jobs (no transcript export),
+ * wait on completion, check hits via NPU hitResult, return.
  * The NPU vec kernel now performs BLAKE3 hash + le256 comparison in-kernel and writes
  * hitResult[2] = {encoded_tile, hit_flag} to a small GM buffer that is D2H copied (8 bytes). */
 #include <stdint.h>
@@ -19,8 +20,8 @@
 #define MAXT 256
 #define MAXSLOT 48
 
-extern void pearl_strip_submit(const int8_t *a);
-extern const uint32_t *pearl_strip_wait_ptr(void);
+extern void pearl_strip_submit_fast(const int8_t *a);
+extern void pearl_strip_wait_done(void);
 extern int pearl_mbatch(void);
 extern void pearl_set_key_target(const uint32_t *key, const uint32_t *target);
 extern void pearl_set_nhi(int n_hi);
@@ -57,13 +58,13 @@ int scan_full(const int8_t *a_noised, int num_strips,
     pearl_set_key_target(key_u32, target);
     pearl_set_nhi(n_hi);   // vec kernel hashes all n_hi tiles/band; encodes hit per miner.c
 
-    pearl_strip_submit(a_noised);
+    pearl_strip_submit_fast(a_noised);
     for (int ss = 0; ss < n_super; ss++) {
         if (ss + 1 < n_super)
-            pearl_strip_submit(a_noised + (size_t)(ss + 1) * G * R * K);
+            pearl_strip_submit_fast(a_noised + (size_t)(ss + 1) * G * R * K);
         
         // Wait for this strip to complete
-        pearl_strip_wait_ptr();
+        pearl_strip_wait_done();
         
         // Check for hit from NPU
         int h_strip, h_tile;
