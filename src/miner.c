@@ -1,9 +1,5 @@
-/*
- * Pearl C miner — prep/scan/proof main loop, dev-fee time-slice, reuse-B.
- * Pool-agnostic: every wire-protocol detail lives in src/pools/.
- * Each binary links exactly one frontend.
- *
- * usage: ascend_prl_<pool> <devid> <worker> <host> <port> <address> <password>
+/* Pool-independent miner: overlaps preparation and NPU scanning, with optional B reuse.
+ * Usage: ascend_prl_<pool> <devid> <worker> <host> <port> <address> <password>
  */
 #include "pools/pool.h"
 #include <pthread.h>
@@ -34,9 +30,9 @@ extern int prep_random(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *key,
                        int8_t *An, int8_t *Btn, int8_t *EAL, int8_t *EBR,
                        uint8_t *rA, uint8_t *rB, uint8_t *cA, uint8_t *cB, int nt, int cert_version);
 extern int prep_random_bt(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *key,
-                       int64_t m, int64_t n, int64_t k, int rank,
-                       int8_t *An, int8_t *bt_packed, int8_t *EAL, int8_t *EBR,
-                       uint8_t *rA, uint8_t *rB, uint8_t *cA, uint8_t *cB, int nt, int cert_version);
+                          int64_t m, int64_t n, int64_t k, int rank,
+                          int8_t *An, int8_t *bt_packed, int8_t *EAL, int8_t *EBR,
+                          uint8_t *rA, uint8_t *rB, uint8_t *cA, uint8_t *cB, int nt, int cert_version);
 extern int prep_b_side(uint64_t seed, int8_t *B, const uint8_t *key,
                        int64_t n, int64_t k, int rank,
                        int8_t *bt_packed, int8_t *EBR, uint8_t *rootB, uint8_t *commitB, int nt, int cert_version);
@@ -71,7 +67,11 @@ static int do_handshake(const char *host, int port, const char *addr,
         if (ok && mp.have) break;
         usleep(100000);
     }
-    if (!(user_conn.job.have && mp.have)) { user_conn.dead = 1; if (user_conn.fd >= 0) close(user_conn.fd); return -1; }
+    if (!(user_conn.job.have && mp.have)) {
+        user_conn.dead = 1;
+        if (user_conn.fd >= 0) close(user_conn.fd);
+        return -1;
+    }
     printf("[stratum] ready (pool=%s rank=%ld k=%ld %ldx%ld)\n",
            POOL.name, mp.rank, mp.k, mp.m, mp.n);
     return 0;
@@ -86,6 +86,7 @@ static int do_handshake(const char *host, int port, const char *addr,
 #endif
 static int g_dev_now = 0;
 static time_t g_fee_anchor = 0;
+// The developer connection is prewarmed before its periodic time slice begins.
 static long dev_secs_to_window(void) {
     if (!g_fee_anchor) g_fee_anchor = time(0);
     long cyc = DEV_FEE_CYCLE_S, win = cyc * DEV_FEE_PERMILLE / 1000; if (win < 1) win = 1;
@@ -131,6 +132,8 @@ static struct {
     int slot, valid; long since;
 } bs;
 
+// Refresh the cached B commitment on job changes or after PRL_BREUSE iterations.
+// The matching A side must use this exact B commitment to build valid proofs.
 static int ensure_bside(long N, long Kc, int rank, int prep_n) {
     long refresh = getenv("PRL_BREUSE") ? atol(getenv("PRL_BREUSE")) : 0;
     pthread_mutex_lock(&job_mu);
@@ -173,6 +176,7 @@ static void *prep_worker(void *p) {
         delay_ms = atol(ds);
     } else {
         long margin = getenv("PRL_PREP_MARGIN_MS") ? atol(getenv("PRL_PREP_MARGIN_MS")) : 1000;
+        // Offset preparation so the next B upload finishes near the current scan.
         delay_ms = g_last_scan_ms - g_last_prep_ms - margin;
         if (delay_ms < 0) delay_ms = 0;
     }
@@ -209,7 +213,8 @@ static void bundle_key(bundle_t *b) {
     pthread_mutex_unlock(&job_mu);
 }
 
-/* coexistence: SIGUSR1 = pause (ACK when quiescent), SIGUSR2 = resume */
+// SIGUSR1 requests a pause; acknowledge only after the current NPU scan is done.
+// SIGUSR2 lets the loop resume without interrupting an in-flight kernel.
 static volatile sig_atomic_t g_pause_req = 0;
 static volatile sig_atomic_t g_ack_pid = 0;
 static void on_pause_sig(int sig, siginfo_t *si, void *u) {
@@ -239,10 +244,16 @@ int main(int argc, char **argv) {
     const char *worker = argv[2], *host = argv[3], *addr = argv[5], *pass = argv[6];
     int port = atoi(argv[4]);
     signal(SIGPIPE, SIG_IGN);
-    { struct sigaction sa; memset(&sa, 0, sizeof sa);
-      sa.sa_flags = SA_SIGINFO | SA_RESTART; sigemptyset(&sa.sa_mask);
-      sa.sa_sigaction = on_pause_sig;  sigaction(SIGUSR1, &sa, 0);
-      sa.sa_sigaction = on_resume_sig; sigaction(SIGUSR2, &sa, 0); }
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_sigaction = on_pause_sig;
+        sigaction(SIGUSR1, &sa, 0);
+        sa.sa_sigaction = on_resume_sig;
+        sigaction(SIGUSR2, &sa, 0);
+    }
     setvbuf(stdout, 0, _IOLBF, 0);
     g_reuse_b = getenv("PRL_REUSE_B") ? 1 : 0;
     pool_conn_init(&user_conn, "");
@@ -293,15 +304,20 @@ int main(int argc, char **argv) {
     time_t t_start = time(0);
     while (1) {
 #if DEV_FEE_PERMILLE > 0
-        { long s2w = dev_secs_to_window();
-          if (dev_conn.fd < 0 && s2w <= DEV_FEE_PREOPEN_S) dev_open(host, port, worker, pass);
-          if (s2w == 0 && !g_dev_now && !dev_conn.dead && dev_conn.job.have) {
-              g_dev_now = 1; g_job = &dev_conn.job; printf("[dev-fee] window OPEN -> mining for dev\n"); }
-          if ((s2w != 0 || dev_conn.dead) && g_dev_now) {
-              g_dev_now = 0; g_job = &user_conn.job;
-              printf("[dev-fee] window CLOSE -> mining for user (dev shares so far %ld)\n", g_fee_sub);
-              dev_close(); }
-          if (s2w > DEV_FEE_PREOPEN_S && dev_conn.fd >= 0 && !g_dev_now) dev_close(); }
+        {
+            long s2w = dev_secs_to_window();
+            if (dev_conn.fd < 0 && s2w <= DEV_FEE_PREOPEN_S) dev_open(host, port, worker, pass);
+            if (s2w == 0 && !g_dev_now && !dev_conn.dead && dev_conn.job.have) {
+                g_dev_now = 1; g_job = &dev_conn.job;
+                printf("[dev-fee] window OPEN -> mining for dev\n");
+            }
+            if ((s2w != 0 || dev_conn.dead) && g_dev_now) {
+                g_dev_now = 0; g_job = &user_conn.job;
+                printf("[dev-fee] window CLOSE -> mining for user (dev shares so far %ld)\n", g_fee_sub);
+                dev_close();
+            }
+            if (s2w > DEV_FEE_PREOPEN_S && dev_conn.fd >= 0 && !g_dev_now) dev_close();
+        }
 #endif
         if (user_conn.dead) {
             puts("[!] (re)connecting");
@@ -311,12 +327,14 @@ int main(int argc, char **argv) {
 #endif
             while (do_handshake(host, port, addr, worker, pass)) sleep(10);
         }
+        // Two bundles let CPU preparation and B transfer overlap NPU scanning.
         bundle_t *cur = &bun[iter % 2], *nxt = &bun[(iter + 1) % 2];
         struct timespec lj0; clock_gettime(CLOCK_MONOTONIC, &lj0);
         pthread_join(pt, 0);
         struct timespec lj1; clock_gettime(CLOCK_MONOTONIC, &lj1);
         coexist_gate();
         if (g_reuse_b) {
+            // A fresh B side invalidates the A prepared against the previous commitment.
             int prep_n = getenv("PRL_PREP_THREADS") ? atoi(getenv("PRL_PREP_THREADS")) : 64;
             if (ensure_bside(N, Kc, (int)mp.rank, prep_n)) {
                 uint64_t s = ((uint64_t)rand() << 32) ^ (uint64_t)time(0) ^ 0xA5A5ULL;
@@ -352,6 +370,7 @@ int main(int argc, char **argv) {
                     (sb.tv_sec-sbb.tv_sec)*1e3 + (sb.tv_nsec-sbb.tv_nsec)/1e6);
         iter++;
         if (rc) {
+            // Decode the vector kernel's tile index into the logical row/column origin.
             int hi = ht / nbands, wi = ht % nbands;
             long row = (long)hs * R + (long)(hi / ht_per_block) * 64 + hi % ht_per_block;
             long col = (long)wi * 64;
@@ -387,8 +406,13 @@ int main(int argc, char **argv) {
         double el = difftime(time(0), t_start);
         printf("[*] iter %ld scan %.0fs%s | %.3f iter/s | shares %ld/%ld\n",
                iter, difftime(time(0), t0), rc ? " HIT" : "", iter / (el > 0 ? el : 1), shares_acc, shares_sub);
-        { const char *mi = getenv("PRL_MAX_ITERS");
-          if (mi && iter >= atol(mi)) { puts("[*] PRL_MAX_ITERS reached, exiting"); break; } }
+        {
+            const char *mi = getenv("PRL_MAX_ITERS");
+            if (mi && iter >= atol(mi)) {
+                puts("[*] PRL_MAX_ITERS reached, exiting");
+                break;
+            }
+        }
     }
     return 0;
 }

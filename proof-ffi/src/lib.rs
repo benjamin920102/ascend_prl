@@ -1,8 +1,4 @@
-//! C ABI for PlainProof construction.
-//!
-//! Builds keyed Merkle trees over raw A (m*k) and B (n*k) bytes, takes multileaf
-//! proofs for the hit rows/cols, serializes the PlainProof with bincode and
-//! base64-encodes into the caller's buffer.
+//! C ABI for constructing keyed multileaf Merkle proofs and serializing PlainProof.
 
 use blake3::CHUNK_LEN;
 use pearl_blake3::MerkleTree;
@@ -26,7 +22,8 @@ fn matrix_proof(data: &[u8], key: [u8; 32], rows: &[usize], cols: usize) -> Matr
     )
 }
 
-/// hash key = blake3(incomplete_header || mining_config.to_bytes()).
+/// Bind the incomplete header to the exact mining configuration via BLAKE3.
+/// The caller must provide valid pointers and a writable 32-byte `out` buffer.
 #[no_mangle]
 pub unsafe extern "C" fn hash_key(
     header: *const u8,
@@ -59,8 +56,9 @@ pub unsafe extern "C" fn hash_key(
     0
 }
 
-/// Build a PlainProof and write base64 into out (cap bytes). Returns the b64
-/// length, or -1 if cap was too small. A is m*k bytes, B is n*k bytes.
+/// Serialize a PlainProof as base64(bincode), returning its length or -1 if
+/// the output capacity is insufficient. All pointers must refer to valid
+/// buffers of the indicated sizes; `out` must be writable for `cap` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn build_proof_b64(
     a: *const u8,
@@ -85,6 +83,8 @@ pub unsafe extern "C" fn build_proof_b64(
     let a_rows = std::slice::from_raw_parts(a_rows, na);
     let b_cols = std::slice::from_raw_parts(b_cols, nb);
 
+    // The row/column proof indices refer to the original matrices, not their
+    // noised forms used by the NPU scan.
     let proof = PlainProof {
         m,
         n,

@@ -1,12 +1,10 @@
 #!/bin/bash
-# Run the pearl_miner release image with the NPU device + driver mounts the binary
-# needs (the host driver supplies libascend_hal.so; the image has only the CANN
-# runtime). Mirrors how the build container is mounted.
+# Mount the host Ascend devices, driver libraries, and DCMI into the container.
 #
 # Env:  WALLET (required)  POOL (default 127.0.0.1)  PORT (default 7000)
 #       DEVICES (space/comma davinci ids, default "4 5 6 7" — the mining NPUs)
-#       TAG (default pearl_miner:latest)  NAME (default pearl_miner)
-#       BIN (default kryptex binary; set to /opt/pearl/build/ascend_prl_k1pool for K1)
+#       TAG (default ascend_prl:latest)  NAME (default ascend_prl)
+#       BIN (default kryptex binary; select ascend_prl_k1 for K1)
 set -eu
 : "${WALLET:?set WALLET=prl1...}"
 TAG="${TAG:-ascend_prl:latest}"; NAME="${NAME:-ascend_prl}"

@@ -1,13 +1,4 @@
-/*
- * k1 frontend — k1pool object protocol (kryptex-style).
- *
- * eu.pearl.k1pool.com:5566 dialect:
- *   - mining.authorize params: {wallet, worker, agent}
- *   - mining.notify params: {header, height, job_id, target, cert_version}
- *   - rank/shape: miner-chosen (encoded in PlainProof)
- *   - adjusted target: pool_target(BE) * tile_elems * rounded_k
- *   - mining.submit params: {wallet, worker, job_id, plain_proof}
- */
+/* K1 object-protocol frontend: miner-chosen shape, BE target and object submissions. */
 #include "pool.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,8 +52,11 @@ static void k1_handle_notify(pool_conn_t *c, const char *line) {
         memset(ptarget, 0, 32);
         int tn = hex2bin(tgt, ptarget, 32);
         if (tn > 0) {
-            if (tn < 32) { memmove(ptarget + (32 - tn), ptarget, tn);
-                           memset(ptarget, 0, 32 - tn); }
+            // Left-pad abbreviated big-endian targets to the full 32-byte width.
+            if (tn < 32) {
+                memmove(ptarget + (32 - tn), ptarget, tn);
+                memset(ptarget, 0, 32 - tn);
+            }
             have_t = 1;
         }
     }

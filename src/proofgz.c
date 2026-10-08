@@ -1,9 +1,5 @@
-/*
- * Optional gzip transform for the kryptex type:"v2" submit path.
- *
- * The proof FFI emits base64(bincode) ~136KB. When gzip is negotiated, this
- * pipes the base64 through decode -> gzip -> re-encode, yielding ~15-16KB.
- * Uses libz (minimal ABI declared inline; no <zlib.h> needed).
+/* Kryptex v2 expects base64(gzip(bincode)), not gzip of the base64 text.
+ * Declare the minimal zlib ABI locally so the runtime library can be linked.
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -11,7 +7,6 @@
 #include <string.h>
 #include <sys/types.h>
 
-/* ---- minimal zlib ABI ---- */
 typedef struct {
     const unsigned char *next_in; unsigned int avail_in; unsigned long total_in;
     unsigned char *next_out; unsigned int avail_out; unsigned long total_out;
@@ -68,6 +63,7 @@ static int b64_val(int c) {
     return -1;
 }
 
+// Ignore non-alphabet characters; an incomplete final quartet yields 1 or 2 bytes.
 static ssize_t b64_decode(const char *in, size_t n, uint8_t *out, size_t cap) {
     int q[4], qi = 0; size_t o = 0;
     for (size_t i = 0; i < n; i++) {
@@ -91,7 +87,6 @@ static ssize_t b64_decode(const char *in, size_t n, uint8_t *out, size_t cap) {
     return (ssize_t)o;
 }
 
-/* base64(bincode) -> base64(gzip(bincode)). Returns new b64 length or -1. */
 ssize_t gzip_proof_b64(const char *in_b64, size_t in_len, uint8_t *out, size_t cap) {
     size_t bin_cap = (in_len / 4) * 3 + 4;
     uint8_t *bin = malloc(bin_cap);

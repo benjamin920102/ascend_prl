@@ -1,6 +1,5 @@
 #!/bin/bash
-# Download the latest pre-built release (miner + .so libs) from GitHub Releases into ./build/.
-# Requires a published release with a `build.tar.gz` (or `build-aarch64.tar.gz`) asset.
+# Fetch the published build tarball from the latest GitHub release.
 set -eu
 REPO="${REPO:-arabel1a/ascend_prl}"
 cd "$(dirname "$0")/.."

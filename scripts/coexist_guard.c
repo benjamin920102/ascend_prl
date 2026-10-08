@@ -1,22 +1,6 @@
-/*
- * coexist_guard — DCMI per-device coexistence guard for the pearl miner.
- *
- * Lets the miner share Ascend dies with other tenants (vLLM, training, etc.)
- * without kernel-collision crashes. The guard owns the "who's on the NPU" decision;
- * the miner pauses/resumes on SIGUSR1/SIGUSR2 (see coexist block in src/miner.c).
- *
- * Detection uses DCMI (not fanotify — Ascend processes hold /dev/davinci_manager,
- * not /dev/davinci<N>, so fanotify marks never fire). DCMI lists every process
- * holding device memory and translates pids into the caller's pid namespace.
- *
- * Per poll, per device:
- *   - pid matches miner regex (/proc/<pid>/comm) -> OUR miner
- *   - anything else (tenant or pid 0 = other namespace) -> FOREIGN
- * Foreign tenant present -> pause miners (SIGUSR1, wait for ACK); gone -> resume (SIGUSR2).
- *
- * Build: gcc -O2 -I/usr/local/dcmi -o coexist_guard coexist_guard.c \
- *            -L/usr/local/dcmi -ldcmi -Wl,-rpath,/usr/local/dcmi
- * Run:   ./coexist_guard [-p poll_ms] [-t ack_s] [-m miner_regex] [-n notify_cmd] <dev>...
+/* DCMI detects NPU tenants that cannot be reliably seen through /dev/davinci*
+ * file watches. A non-miner PID (including a foreign-namespace PID) causes the
+ * miner to pause via SIGUSR1; SIGUSR2 resumes it after the device is clear.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -60,6 +44,7 @@ static int is_miner(int pid) {
     return regexec(&g_minere, comm, 0, 0, 0) == 0;
 }
 
+// PID 0 or an inaccessible /proc entry is conservatively treated as foreign.
 static int scan_device(struct managed *m, int *mp, int cap, int *nminer) {
     struct dcmi_proc_mem_info procs[MAXPROC];
     int n = MAXPROC;
@@ -72,6 +57,7 @@ static int scan_device(struct managed *m, int *mp, int cap, int *nminer) {
     return foreign;
 }
 
+// Wait for the miner's quiescence ACK rather than assuming SIGUSR1 is immediate.
 static void pause_dev(struct managed *m, int *mp, int nminer) {
     if (m->paused) return;
     g_ack = 0;

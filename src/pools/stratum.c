@@ -1,7 +1,4 @@
-/*
- * Shared stratum plumbing: socket connect, line-buffered reader thread, JSON helpers,
- * share-result counters, and 256-bit target arithmetic.
- */
+/* Stratum transport, response handling, and 256-bit share-target arithmetic. */
 #include "pool.h"
 #include <netdb.h>
 #include <stdio.h>
@@ -50,6 +47,7 @@ int pool_connect(pool_conn_t *c, const char *host, int port) {
 }
 
 typedef struct { pool_conn_t *c; mining_params_t *mp; } reader_arg_t;
+// Buffer incomplete lines across reads; each newline completes one pool message.
 static void *reader_thread(void *arg) {
     reader_arg_t *ra = arg;
     pool_conn_t *c = ra->c;
@@ -96,7 +94,6 @@ void pool_handle_result(pool_conn_t *c, const char *line) {
     }
 }
 
-/* ---- tiny JSON helpers ---- */
 const char *jfind(const char *s, const char *key) {
     static char pat[64];
     snprintf(pat, sizeof pat, "\"%s\"", key);
@@ -136,7 +133,7 @@ int hex2bin(const char *h, uint8_t *out, size_t cap) {
     return (int)n;
 }
 
-/* ---- target arithmetic ---- */
+// Multiply a little-endian 256-bit target by a scalar, saturating on overflow.
 void mul_limbs(const uint32_t q[8], uint64_t f, uint32_t out[8]) {
     unsigned __int128 carry = 0;
     uint32_t res[8];
@@ -149,7 +146,7 @@ void mul_limbs(const uint32_t q[8], uint64_t f, uint32_t out[8]) {
     memcpy(out, res, 32);
 }
 
-/* adjusted target = floor(maxtgt/diff) * tile_elems*rounded_k (AlphaPool/k1pool dialect) */
+// Divide the pool maximum by difficulty, then scale by work per sampled tile.
 void target_from_diff(double diff, long tile_elems_rounded_k, uint32_t out[8]) {
     if (diff <= 0) { memset(out, 0xff, 32); return; }
     uint32_t maxt[8] = {0};
@@ -164,7 +161,7 @@ void target_from_diff(double diff, long tile_elems_rounded_k, uint32_t out[8]) {
     mul_limbs(q, (uint64_t)tile_elems_rounded_k, out);
 }
 
-/* adjusted target = pool_target(BE 32B) * tile_elems*rounded_k (kryptex dialect) */
+// Convert the pool's big-endian target into little-endian limbs before scaling.
 void target_from_be(const uint8_t be[32], long tile_elems_rounded_k, uint32_t out[8]) {
     uint32_t q[8];
     for (int i = 0; i < 8; i++)

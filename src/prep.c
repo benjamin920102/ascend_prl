@@ -13,10 +13,8 @@
 #define ZERO_POINT 32
 #define RANGE_MASK 63
 
-/*
- * V3 salted-seed fork: noise seeds are derived by binding each root to its
- * matrix dimension via keyed BLAKE3 before the seed chain.
- * Salts = blake3("pearl/cert-v3/noise-seed/A"|"B"), matching SEED_SALT_A/B in zk_pow.
+/* Certificate v3 binds each Merkle root to its matrix dimension before deriving
+ * noise seeds. These constants must match the A/B domain salts in zk_pow.
  */
 static const uint8_t SEED_SALT_A[32] = {
     0x82, 0x49, 0x40, 0x6c, 0xa0, 0xed, 0x15, 0x16, 0x96, 0x16, 0xf6, 0x92, 0xfc, 0xf0, 0x76, 0xf8,
@@ -27,7 +25,7 @@ static const uint8_t SEED_SALT_B[32] = {
     0x1a, 0xe9, 0xc6, 0x39, 0x88, 0xe8, 0xcc, 0x04, 0x48, 0x44, 0x30, 0x1d, 0x71, 0xb8, 0x9a, 0xa9,
 };
 
-/* root || dim(u32 LE) || 28 zero bytes — one 64-byte BLAKE3 block */
+// Hash a fixed 64-byte block: root || dimension (LE u32) || 28 zero bytes.
 static void bind_root(const uint8_t root[32], uint32_t dim, const uint8_t salt[32], uint8_t out[32]) {
     uint8_t msg[64] = {0};
     memcpy(msg, root, 32);
@@ -164,6 +162,8 @@ static void unif_int8(const uint8_t *seed, const uint8_t *key, int64_t nbytes, i
 #endif
 }
 
+// Each index pair is deterministically derived from the commitment; XOR ensures
+// the second rank index differs from the first without a rejection loop.
 static void perm_pairs(const uint8_t *seed, const uint8_t *key, int64_t lines, int rank,
                        uint16_t *first, uint16_t *second) {
     int64_t draws = (lines * 4 + DIGEST - 1) / DIGEST;
@@ -230,6 +230,8 @@ static void compute_bn(const int8_t *B, const int8_t *EBR, int8_t *out,
 }
 
 #define BN_PACK 64
+// Pack the noised B matrix by 64-column band and rank-sized fold, matching the
+// NPU cube kernel's [band][fold][column][k] access order.
 static void compute_bn_pack(const int8_t *B, const int8_t *EBR, int8_t *bt,
                             const uint16_t *f, const uint16_t *s,
                             int64_t k, int64_t n, int R, int nt) {
@@ -271,6 +273,7 @@ static int prep_from_ab_impl(const int8_t *A, const int8_t *B, const uint8_t *ke
     uint8_t saltedA[32], saltedB[32];
     salt_roots(cert_mode, rootA, rootB, (uint32_t)m, (uint32_t)n, saltedA, saltedB);
 
+    // B commits first; A commits to B, so the two noise seeds are linked.
     blake3_hasher h;
     blake3_hasher_init(&h); blake3_hasher_update(&h, key, 32);
     blake3_hasher_update(&h, saltedB, 32); blake3_hasher_finalize(&h, commitB, 32);
@@ -306,10 +309,10 @@ int prep_from_ab(const int8_t *A, const int8_t *B, const uint8_t *key,
 }
 
 static int prep_random_impl(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *key,
-                int64_t m, int64_t n, int64_t k, int R,
-                int8_t *A_noised, int8_t *Bt_out, int8_t *EAL, int8_t *EBR,
-                uint8_t *rootA, uint8_t *rootB, uint8_t *commitA, uint8_t *commitB,
-                int nt, int pack, int cert_mode) {
+                            int64_t m, int64_t n, int64_t k, int R,
+                            int8_t *A_noised, int8_t *Bt_out, int8_t *EAL, int8_t *EBR,
+                            uint8_t *rootA, uint8_t *rootB, uint8_t *commitA, uint8_t *commitB,
+                            int nt, int pack, int cert_mode) {
     fill_buf(A, m * k, seed, nt);
     fill_buf(B, n * k, seed ^ 0xB0B0B0B0ULL, nt);
     return prep_from_ab_impl(A, B, key, m, n, k, R, A_noised, Bt_out,

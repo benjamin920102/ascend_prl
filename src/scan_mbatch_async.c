@@ -1,5 +1,4 @@
-/* M-batch scan: main thread drives submit/wait on NPU; all BLAKE3 hashing done on NPU.
- * scan_full: reset state, submit strips, wait for completion, return hit result. */
+/* Submit super-strips to the NPU; the vector kernel hashes and checks tile hits. */
 #include <stdint.h>
 #include <string.h>
 #include <pthread.h>
@@ -36,7 +35,8 @@ int scan_full(const int8_t *a_noised, int num_strips,
     (void)scratch;
     (void)pow_threads;
 
-    int G = pearl_mbatch(); if (G < 1) G = 1;
+    int G = pearl_mbatch();
+    if (G < 1) G = 1;
     int n_super = num_strips / G;
 
     pthread_mutex_lock(&A.mu);
@@ -50,6 +50,8 @@ int scan_full(const int8_t *a_noised, int num_strips,
     pearl_set_key_target(key_u32, target);
     pearl_set_nhi(n_hi);
 
+    // Prime the pipeline, then submit the next super-strip before waiting on
+    // the oldest one. The underlying kernel owns two in-flight buffer slots.
     pearl_strip_submit_fast(a_noised);
     for (int ss = 0; ss < n_super; ss++) {
         if (ss + 1 < n_super)

@@ -1,13 +1,4 @@
-/*
- * Kryptex frontend — plain stratum, miner-chosen rank/shape.
- *
- * pool.kryptex.com/prl dialect:
- *   - handshake: subscribe + authorize; authorize starts the job feed.
- *   - mining.notify.params: object {header, height, job_id, target}.
- *   - mining.submit.params: object {worker, job_id, plain_proof}.
- *   - adjusted target: pool_target(BE) * tile_elems * rounded_k.
- *   - type:"v2" authorize negotiates gzip-compressed proof submission.
- */
+/* Kryptex object-protocol frontend; v2 authorization negotiates gzip proofs. */
 #include "pool.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,8 +56,11 @@ static void k_handle_notify(pool_conn_t *c, const char *line) {
         memset(ptarget, 0, 32);
         int tn = hex2bin(tgt, ptarget, 32);
         if (tn > 0) {
-            if (tn < 32) { memmove(ptarget + (32 - tn), ptarget, tn);
-                           memset(ptarget, 0, 32 - tn); }
+            // Pool targets may omit leading zero bytes.
+            if (tn < 32) {
+                memmove(ptarget + (32 - tn), ptarget, tn);
+                memset(ptarget, 0, 32 - tn);
+            }
             have_t = 1;
         }
     }
@@ -108,6 +102,7 @@ static void k_build_target(const job_t *J, int tile_h, long rounded_k, uint32_t 
 static int k_submit_prefix(pool_conn_t *c, const char *addr, const char *worker,
                            const char *job_id, char *msg, size_t cap, const char **tail) {
     *tail = "\"}}";
+    // Only a negotiated gzip session may override the proof field name.
     const char *field = "plain_proof";
     if (c->gzip) { const char *e = getenv("PRL_GZIP_FIELD"); if (e && *e) field = e; }
     return snprintf(msg, cap, "{\"id\":%d,\"method\":\"mining.submit\",\"params\":"

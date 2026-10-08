@@ -1,8 +1,7 @@
-/* pthread implementation of blake3's parallel split hook.
- * blake3.c (compiled -DBLAKE3_USE_TBB) calls this for each left/right subtree split;
- * we run the LEFT subtree on a helper thread and the RIGHT in-place, bounded by a
- * global concurrency budget. Digest is bit-identical to the serial path.
- * Small subtrees run serially to avoid pthread overhead. */
+/* BLAKE3 split hook: execute the left subtree on a helper thread when the
+ * subtree is large enough and the global thread budget allows it. The right
+ * subtree stays on the caller thread, preserving the serial digest.
+ */
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -47,6 +46,7 @@ void blake3_compress_subtree_wide_join_tbb(
         if (g_budget < PRL_B3_CAP) { g_budget++; spawn = 1; }
         pthread_mutex_unlock(&g_bmu);
     }
+    // If creating the helper fails, release the reserved budget and run serially.
     if (spawn) {
         sub_arg la = { l_input, l_input_len, key, l_chunk_counter, flags, l_cvs, l_n, use_tbb };
         pthread_t t;
