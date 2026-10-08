@@ -1,38 +1,21 @@
 /*
  * coexist_guard — DCMI per-device coexistence guard for the pearl miner.
  *
- * Lets the miner share Ascend dies with other tenants (vLLM, training, ...) without the crash you
- * get from two processes running kernels on one die at once. The guard owns the "who's on the NPU"
- * decision; the miner is a passive endpoint that pauses/resumes on signal (see the coexist block in
- * src/miner.c). Run it ALONGSIDE the miners, in the SAME container (launch.sh starts it for you).
+ * Lets the miner share Ascend dies with other tenants (vLLM, training, etc.)
+ * without kernel-collision crashes. The guard owns the "who's on the NPU" decision;
+ * the miner pauses/resumes on SIGUSR1/SIGUSR2 (see coexist block in src/miner.c).
  *
- * WHY DCMI AND NOT fanotify (observed on Linux kernel 6.6):
- *   - Ascend compute processes hold /dev/davinci_manager open, NOT /dev/davinci<N>, so a per-device
- *     fanotify mark never fires for a tenant.
- *   - The manager char-device emits NO fsnotify open events at all (inode/mount/fs marks: 0 events
- *     while a real open succeeds), so fanotify can't catch tenant startup either.
- *   - Each container's /dev is a separate tmpfs, so fanotify marks don't cross namespaces anyway.
- *   DCMI (the driver's per-device compute-process table, what npu-smi is built on) is the only
- *   reliable signal. It lists every process holding device memory (so it catches an idle-but-loaded
- *   vLLM, not just an active one) and TRANSLATES pids into the caller's pid namespace.
+ * Detection uses DCMI (not fanotify — Ascend processes hold /dev/davinci_manager,
+ * not /dev/davinci<N>, so fanotify marks never fire). DCMI lists every process
+ * holding device memory and translates pids into the caller's pid namespace.
  *
- * SELF-DISCOVERY: per poll, per device, we read the DCMI process list and classify each entry:
- *   - pid > 0 AND /proc/<pid>/comm matches the miner regex (default "ascend_prl")  -> OUR miner
- *   - anything else (a tenant's pid, or a pid 0 == a process in another namespace we can't see)
- *     -> FOREIGN.
- * If a die has a foreign tenant, pause its miner(s) (SIGUSR1, wait for ACK or -t timeout); when the
- * die is the miner's alone again, resume (SIGUSR2). No pids to wire: the miner can even restart and
- * the guard re-finds it. Because an unidentifiable (other-namespace) process counts as foreign, the
- * guard yields correctly even to a vLLM in a different container; running the miner container with
- * --pid=host additionally lets the guard NAME that pid in its logs (optional, not required).
+ * Per poll, per device:
+ *   - pid matches miner regex (/proc/<pid>/comm) -> OUR miner
+ *   - anything else (tenant or pid 0 = other namespace) -> FOREIGN
+ * Foreign tenant present -> pause miners (SIGUSR1, wait for ACK); gone -> resume (SIGUSR2).
  *
- * Tradeoff vs the (impossible) fanotify path: detection is poll-latency, not instant-at-open. Keep
- * -p small (default 500ms); a tenant shows up in DCMI at its init (memory alloc), before it runs
- * inference kernels, so the practical race is small. The airtight fix is a cooperative signal from
- * the tenant (e.g. a vLLM hook doing `kill -USR1 <miner>`), which this SIGUSR1 interface supports.
- *
- * Build: gcc -O2 -I/usr/local/dcmi -o coexist_guard coexist_guard.c -L/usr/local/dcmi -ldcmi \
- *            -Wl,-rpath,/usr/local/dcmi
+ * Build: gcc -O2 -I/usr/local/dcmi -o coexist_guard coexist_guard.c \
+ *            -L/usr/local/dcmi -ldcmi -Wl,-rpath,/usr/local/dcmi
  * Run:   ./coexist_guard [-p poll_ms] [-t ack_s] [-m miner_regex] [-n notify_cmd] <dev>...
  */
 #define _GNU_SOURCE
@@ -51,7 +34,7 @@
 #define MAXMINE 16
 
 static volatile sig_atomic_t g_ack = 0;
-static void on_ack(int s) { (void)s; g_ack = 1; }       /* miner -> guard: "I'm quiescent" */
+static void on_ack(int s) { (void)s; g_ack = 1; }
 
 static const char *g_notify = 0;
 static int g_ack_timeout_ms = 8000;
@@ -66,19 +49,17 @@ static void notify(const char *state, struct managed *m) {
     int rc = system(cmd); (void)rc;
 }
 
-/* is this pid one of our miners? (pid>0 and its comm matches the miner regex) */
 static int is_miner(int pid) {
     if (pid <= 0) return 0;
     char p[64], comm[64] = "";
     snprintf(p, sizeof p, "/proc/%d/comm", pid);
     FILE *f = fopen(p, "r");
-    if (!f) return 0;                                   /* can't read -> not confirmed ours -> foreign */
+    if (!f) return 0;
     if (fgets(comm, sizeof comm, f)) comm[strcspn(comm, "\n")] = 0;
     fclose(f);
     return regexec(&g_minere, comm, 0, 0, 0) == 0;
 }
 
-/* fill miner pids on the device into mp[] (<=cap), return foreign-process count. -1 on query error. */
 static int scan_device(struct managed *m, int *mp, int cap, int *nminer) {
     struct dcmi_proc_mem_info procs[MAXPROC];
     int n = MAXPROC;
@@ -86,7 +67,7 @@ static int scan_device(struct managed *m, int *mp, int cap, int *nminer) {
     int foreign = 0; *nminer = 0;
     for (int i = 0; i < n; i++) {
         if (is_miner(procs[i].proc_id)) { if (*nminer < cap) mp[(*nminer)++] = procs[i].proc_id; }
-        else foreign++;                                  /* tenant pid, or pid 0 (other namespace) */
+        else foreign++;
     }
     return foreign;
 }
@@ -102,6 +83,7 @@ static void pause_dev(struct managed *m, int *mp, int nminer) {
            m->logic, nminer, g_ack ? "ACK" : "no-ack/timeout", waited);
     m->paused = 1; notify("pause", m);
 }
+
 static void resume_dev(struct managed *m, int *mp, int nminer) {
     if (!m->paused) return;
     for (int i = 0; i < nminer; i++) kill(mp[i], SIGUSR2);
@@ -127,8 +109,7 @@ int main(int argc, char **argv) {
     if (nmg == 0) {
         fprintf(stderr, "usage: %s [-p poll_ms] [-t ack_s] [-m miner_regex] [-n notify_cmd] <dev>...\n"
                         "  Poll DCMI per device; pause the miner (SIGUSR1) when a foreign tenant appears,\n"
-                        "  resume (SIGUSR2) when the die is the miner's alone again. Miners are found by\n"
-                        "  comm matching <miner_regex> (default ascend_prl). Run in the miners' container.\n", argv[0]);
+                        "  resume (SIGUSR2) when the die is the miner's alone again.\n", argv[0]);
         return 1;
     }
     if (regcomp(&g_minere, minre, REG_EXTENDED | REG_NOSUB)) { fprintf(stderr, "[guard] bad -m regex\n"); return 1; }
@@ -151,7 +132,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < nmg; i++) {
             int mp[MAXMINE], nminer = 0;
             int f = scan_device(&mg[i], mp, MAXMINE, &nminer);
-            if (f < 0) continue;                          /* transient DCMI error: hold state */
+            if (f < 0) continue;
             if (f > 0 && nminer > 0) pause_dev(&mg[i], mp, nminer);
             else if (f == 0) resume_dev(&mg[i], mp, nminer);
         }

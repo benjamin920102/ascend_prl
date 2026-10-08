@@ -1,14 +1,12 @@
 /*
- * k1 frontend — k1pool's OBJECT protocol (kryptex-style).
+ * k1 frontend — k1pool object protocol (kryptex-style).
  *
- * The EU endpoint (eu.pearl.k1pool.com:5566) speaks an object dialect:
- *   - mining.authorize params is an OBJECT: {"wallet":<addr>,"worker":<rig>,"agent":<miner/ver>}
- *   - mining.notify params is an OBJECT: {header,height,job_id:"<hex8>_2097152",
- *                                         target:"<64 nibbles, 53 zero bits>",cert_version:2}
- *   - rank/shape are MINER-CHOSEN (no set_mining_params) and encoded in the PlainProof; the pool
- *     reads them out (so our fixed r512/k8192/16384² is fine — init_params sets it).
- *   - adjusted target = pool_target(BE) * tile_elems * rounded_k  (like kryptex).
- *   - mining.submit params is an OBJECT: {wallet,worker,job_id,plain_proof}.
+ * eu.pearl.k1pool.com:5566 dialect:
+ *   - mining.authorize params: {wallet, worker, agent}
+ *   - mining.notify params: {header, height, job_id, target, cert_version}
+ *   - rank/shape: miner-chosen (encoded in PlainProof)
+ *   - adjusted target: pool_target(BE) * tile_elems * rounded_k
+ *   - mining.submit params: {wallet, worker, job_id, plain_proof}
  */
 #include "pool.h"
 #include <stdio.h>
@@ -30,7 +28,6 @@
 #endif
 
 static void k1_init_params(mining_params_t *mp) {
-    /* miner-chosen; must match the linked kernel .so (K/RANK). Standard [0,32] / [0..63]. */
     mp->m = MDIM; mp->n = MDIM; mp->k = K; mp->rank = RANK;
     mp->rows[0] = 0; mp->rows[1] = 32; mp->nrows = 2;
     for (size_t i = 0; i < 64; i++) mp->cols[i] = i;
@@ -46,7 +43,6 @@ static int k1_open(pool_conn_t *c, const char *host, int port,
     char line[LINE];
     snprintf(line, LINE, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"%s\"]}", K1_AGENT);
     pool_send_line(c, line);
-    /* OBJECT authorize (operator-specified): {wallet, worker, agent} */
     snprintf(line, LINE, "{\"id\":3,\"method\":\"mining.authorize\",\"params\":"
              "{\"wallet\":\"%s\",\"worker\":\"%s\",\"agent\":\"%s\"}}", addr, worker, K1_AGENT);
     pool_send_line(c, line);
@@ -55,18 +51,17 @@ static int k1_open(pool_conn_t *c, const char *host, int port,
 }
 
 static void k1_handle_notify(pool_conn_t *c, const char *line) {
-    /* params is an OBJECT: {header, height, job_id, target, cert_version} */
     char jid[JOBLEN], hdr[2 * HDRLEN], tgt[80];
     if (jstr(line, "header", hdr, sizeof hdr)) return;
     if (jstr(line, "job_id", jid, sizeof jid)) return;
     long height = (long)jnum(line, "height", 0);
-    int cert_version = (int)jnum(line, "cert_version", 1);   /* default: legacy, pre-fork pools omit it */
+    int cert_version = (int)jnum(line, "cert_version", 1);
     uint8_t ptarget[32]; int have_t = 0;
     if (!jstr(line, "target", tgt, sizeof tgt)) {
         memset(ptarget, 0, 32);
-        int tn = hex2bin(tgt, ptarget, 32);     /* up to 64 nibbles, big-endian */
+        int tn = hex2bin(tgt, ptarget, 32);
         if (tn > 0) {
-            if (tn < 32) { memmove(ptarget + (32 - tn), ptarget, tn);   /* right-align BE */
+            if (tn < 32) { memmove(ptarget + (32 - tn), ptarget, tn);
                            memset(ptarget, 0, 32 - tn); }
             have_t = 1;
         }
@@ -101,7 +96,6 @@ static void k1_build_target(const job_t *J, int tile_h, long rounded_k, uint32_t
 
 static int k1_submit_prefix(pool_conn_t *c, const char *addr, const char *worker,
                             const char *job_id, char *msg, size_t cap, const char **tail) {
-    /* OBJECT submit: {wallet, worker, job_id, plain_proof} */
     *tail = "\"}}";
     return snprintf(msg, cap, "{\"id\":%d,\"method\":\"mining.submit\",\"params\":"
                     "{\"wallet\":\"%s\",\"worker\":\"%s\",\"job_id\":\"%s\",\"plain_proof\":\"",
@@ -110,7 +104,7 @@ static int k1_submit_prefix(pool_conn_t *c, const char *addr, const char *worker
 
 const pool_frontend_t POOL = {
     .name = "k1",
-    .miner_chosen_params = 1,            /* object protocol: no set_mining_params; miner picks shape */
+    .miner_chosen_params = 1,
     .init_params = k1_init_params,
     .open = k1_open,
     .dispatch = k1_dispatch,

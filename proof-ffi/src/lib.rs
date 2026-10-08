@@ -1,8 +1,8 @@
 //! C ABI for PlainProof construction.
 //!
-//! Build keyed merkle trees over raw A (m*k) and B (n*k) bytes, take multileaf
-//! proofs for the hit rows/cols, serialize the PlainProof with bincode and
-//! base64-encode into the caller's buffer.
+//! Builds keyed Merkle trees over raw A (m*k) and B (n*k) bytes, takes multileaf
+//! proofs for the hit rows/cols, serializes the PlainProof with bincode and
+//! base64-encodes into the caller's buffer.
 
 use blake3::CHUNK_LEN;
 use pearl_blake3::MerkleTree;
@@ -60,8 +60,7 @@ pub unsafe extern "C" fn hash_key(
 }
 
 /// Build a PlainProof and write base64 into out (cap bytes). Returns the b64
-/// length, or -1 if cap was too small. A is m*k bytes, B is n*k bytes (raw int8,
-/// chunk-aligned shapes only).
+/// length, or -1 if cap was too small. A is m*k bytes, B is n*k bytes.
 #[no_mangle]
 pub unsafe extern "C" fn build_proof_b64(
     a: *const u8,

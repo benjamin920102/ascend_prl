@@ -13,18 +13,11 @@
 #define ZERO_POINT 32
 #define RANGE_MASK 63
 
-/* ---- Salted-Seed fork (cert_version 3) ----------------------------------------------------
- * V3 changes only how the noise seeds are derived from the Merkle roots: each root is first
- * bound to its matrix dimension via a keyed BLAKE3 hash (domain-separated per side), before
- * feeding the (unchanged) b_noise_seed/a_noise_seed chain. Everything else -- circuits, wire
- * formats, share formats -- is unchanged. See docs/salted-seed-fork-upgrade-guide.md and
- * zk-pow/src/api/seed.rs (reference impl + pinned test vectors) in the pearl node repo.
- *
- * bound_a = blake3(hash_a || m_le32 || 28 zero bytes, key = blake3("pearl/cert-v3/noise-seed/A"))
- * bound_b = blake3(hash_b || n_le32 || 28 zero bytes, key = blake3("pearl/cert-v3/noise-seed/B"))
- *
- * The salts below are the hardcoded blake3("pearl/cert-v3/noise-seed/A"|"B") digests (consensus
- * must not depend on runtime string hashing), matching zk_pow::api::seed::SEED_SALT_A/SEED_SALT_B. */
+/*
+ * V3 salted-seed fork: noise seeds are derived by binding each root to its
+ * matrix dimension via keyed BLAKE3 before the seed chain.
+ * Salts = blake3("pearl/cert-v3/noise-seed/A"|"B"), matching SEED_SALT_A/B in zk_pow.
+ */
 static const uint8_t SEED_SALT_A[32] = {
     0x82, 0x49, 0x40, 0x6c, 0xa0, 0xed, 0x15, 0x16, 0x96, 0x16, 0xf6, 0x92, 0xfc, 0xf0, 0x76, 0xf8,
     0x92, 0xdb, 0xdb, 0x2a, 0x70, 0x23, 0xb8, 0x52, 0xf0, 0xd4, 0x77, 0x19, 0xc3, 0x90, 0x01, 0x7b,
@@ -34,19 +27,17 @@ static const uint8_t SEED_SALT_B[32] = {
     0x1a, 0xe9, 0xc6, 0x39, 0x88, 0xe8, 0xcc, 0x04, 0x48, 0x44, 0x30, 0x1d, 0x71, 0xb8, 0x9a, 0xa9,
 };
 
-/* root || dim(u32 LE) || 28 zero bytes -- exactly one 64-byte BLAKE3 block. */
+/* root || dim(u32 LE) || 28 zero bytes — one 64-byte BLAKE3 block */
 static void bind_root(const uint8_t root[32], uint32_t dim, const uint8_t salt[32], uint8_t out[32]) {
     uint8_t msg[64] = {0};
     memcpy(msg, root, 32);
-    memcpy(msg + 32, &dim, 4);   /* host is little-endian (aarch64); dim already in LE */
+    memcpy(msg + 32, &dim, 4);
     blake3_hasher h;
     blake3_hasher_init_keyed(&h, salt);
     blake3_hasher_update(&h, msg, 64);
     blake3_hasher_finalize(&h, out, DIGEST);
 }
 
-/* CERT_LEGACY: pre-V3, roots feed the seed chain unsalted (cert_version 1 and 2).
- * CERT_SALTED: V3+, roots are bound to (m, n) first. */
 #define CERT_LEGACY 0
 #define CERT_SALTED 1
 
@@ -96,19 +87,13 @@ static void draw_hash(uint32_t idx, const uint8_t *seed, const uint8_t *key,
     blake3_hasher_finalize(&h, out, DIGEST);
 }
 
-/* Fill A/B matrices. Default (required for effective gzip v2) is a highly repetitive pattern so
- * plain_proof compresses ~10-100x. Uniform random data is essentially incompressible.
- * See https://gist.github.com/maxmalysh/eaaf4332dbc5ca99d0a78f24a733fffe
- *
- * PRL_ZERO_SEED=0  -> legacy uniform random fill (incompressible proofs)
- * PRL_ZERO_SEED unset / any other value -> zero-fill + 8-byte seed stamp (default, gzippable)
- *
- * Zero + seed stamp keeps each prep distinct (different root/commit/noise → different C) while
- * the vast majority of merkle leaf bytes are identical zeros — gzip loves that. */
+/*
+ * Default: zero-fill + 8-byte seed stamp (gzip-friendly; ~10-100x compression on proofs).
+ * PRL_ZERO_SEED=0: legacy uniform random fill (incompressible).
+ */
 static void fill_buf(int8_t *buf, int64_t total, uint64_t seed, int nt) {
     const char *zs = getenv("PRL_ZERO_SEED");
     if (zs && zs[0] == '0' && zs[1] == '\0') {
-        /* legacy random path */
 #pragma omp parallel num_threads(nt)
         {
             int t = omp_get_thread_num();
@@ -125,7 +110,6 @@ static void fill_buf(int8_t *buf, int64_t total, uint64_t seed, int nt) {
         }
         return;
     }
-    /* gzippable path: long zero runs + unique seed stamp so roots still differ per prep */
     memset(buf, 0, (size_t)total);
     if (total >= 8) {
         uint64_t s = seed;
@@ -160,12 +144,10 @@ static void unif_int8(const uint8_t *seed, const uint8_t *key, int64_t nbytes, i
     }
 
 #ifdef HAVE_NEON
-    int64_t nvec = nbytes / 16; /* number of full 16-byte NEON chunks */
+    int64_t nvec = nbytes / 16;
 #pragma omp parallel for schedule(static) num_threads(nt)
     for (int64_t v = 0; v < nvec; v++) {
         int64_t i = v * 16;
-        /* NEON vandq_u8/vsubq_s8 are lane-wise mod-256 ops, bit-identical
-           to the scalar (raw[i] & MASK) - ZP for every byte. */
         uint8x16_t x = vld1q_u8(raw + i);
         x = vandq_u8(x, vdupq_n_u8(RANGE_MASK));
         int8x16_t sv = vsubq_s8(vreinterpretq_s8_u8(x), vdupq_n_s8(ZERO_POINT));
@@ -212,11 +194,6 @@ static void compute_an(const int8_t *A, const int8_t *EAL, int8_t *out,
 #ifdef HAVE_NEON
         int8_t efb[16], esb[16];
         for (; j + 16 <= k; j += 16) {
-            /* EAL[f[.]]/EAL[s[.]] are data-dependent gathers; ARM NEON has
-               no int8 gather, so collect scalarly into small buffers, then
-               do the add/sub with vector ops. vaddq_s8/vsubq_s8 are
-               lane-wise mod-256, matching scalar int8_t wraparound exactly,
-               and we preserve the original (a + f) - s evaluation order. */
             for (int t = 0; t < 16; t++) {
                 efb[t] = el[f[j + t]];
                 esb[t] = el[s[j + t]];

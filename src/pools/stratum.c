@@ -1,11 +1,6 @@
 /*
- * Shared stratum plumbing — pool-agnostic pieces used by every frontend:
- *   - the socket connect + line-buffered reader thread (one per pool_conn_t)
- *   - tiny JSON field extractors
- *   - the share-result (ACCEPTED/REJECTED) counter
- *   - the 256-bit target arithmetic (diff- and big-endian-derived adjusted targets)
- * The protocol-specific bits (handshake messages, notify shape, submit framing, which
- * target formula) live in the per-pool frontends and reach these via pool.h.
+ * Shared stratum plumbing: socket connect, line-buffered reader thread, JSON helpers,
+ * share-result counters, and 256-bit target arithmetic.
  */
 #include "pool.h"
 #include <netdb.h>
@@ -25,7 +20,7 @@ void pool_conn_init(pool_conn_t *c, const char *tag) {
     c->tag = tag;
     c->gzip = 0;
     c->job.have = 0;
-    c->job.cert_version = 1;   /* legacy default until the first mining.notify sets it */
+    c->job.cert_version = 1;
     pthread_mutex_init(&c->send_mu, 0);
 }
 
@@ -54,13 +49,12 @@ int pool_connect(pool_conn_t *c, const char *host, int port) {
     return 0;
 }
 
-/* ---- the reader thread: read newline-delimited frames, hand each to the frontend ---- */
 typedef struct { pool_conn_t *c; mining_params_t *mp; } reader_arg_t;
 static void *reader_thread(void *arg) {
     reader_arg_t *ra = arg;
     pool_conn_t *c = ra->c;
-    static char buf[1 << 20];                 /* one reader runs per conn; static is fine */
-    char *b = c->tag && c->tag[0] ? malloc(1 << 20) : buf;   /* dev conn gets its own buffer */
+    static char buf[1 << 20];
+    char *b = c->tag && c->tag[0] ? malloc(1 << 20) : buf;
     size_t fill = 0;
     while (!c->dead) {
         ssize_t r = read(c->fd, b + fill, (1 << 20) - fill - 1);
@@ -87,9 +81,6 @@ void pool_start_reader(pool_conn_t *c, mining_params_t *mp) {
     pthread_t t; pthread_create(&t, 0, reader_thread, ra); pthread_detach(t);
 }
 
-/* shared by every frontend's dispatch for result lines (submit acks + cosmetic handshake acks).
- * Space-tolerant (jfind skips ':'/spaces): an error present and not null => reject; otherwise a
- * boolean result of `true` => accept. (Pools send compact JSON; this just doesn't depend on it.) */
 void pool_handle_result(pool_conn_t *c, const char *line) {
     const char *e = jfind(line, "error");
     int has_err = e && strncmp(e, "null", 4) != 0 && *e != '}' && *e != ',';
@@ -146,7 +137,6 @@ int hex2bin(const char *h, uint8_t *out, size_t cap) {
 }
 
 /* ---- target arithmetic ---- */
-/* out = q (LE limbs) * factor, saturated to 2^256-1 on overflow */
 void mul_limbs(const uint32_t q[8], uint64_t f, uint32_t out[8]) {
     unsigned __int128 carry = 0;
     uint32_t res[8];
@@ -159,10 +149,10 @@ void mul_limbs(const uint32_t q[8], uint64_t f, uint32_t out[8]) {
     memcpy(out, res, 32);
 }
 
-/* adjusted target = floor(maxtgt/diff) * tile_elems*rounded_k  (AlphaPool/k1pool dialect) */
+/* adjusted target = floor(maxtgt/diff) * tile_elems*rounded_k (AlphaPool/k1pool dialect) */
 void target_from_diff(double diff, long tile_elems_rounded_k, uint32_t out[8]) {
     if (diff <= 0) { memset(out, 0xff, 32); return; }
-    uint32_t maxt[8] = {0};        /* 0xFFFF * 2^208: limb6 high half (LE limbs) */
+    uint32_t maxt[8] = {0};
     maxt[6] = 0xFFFF0000;
     uint64_t d = (uint64_t)diff, rem = 0;
     uint32_t q[8];
@@ -174,10 +164,10 @@ void target_from_diff(double diff, long tile_elems_rounded_k, uint32_t out[8]) {
     mul_limbs(q, (uint64_t)tile_elems_rounded_k, out);
 }
 
-/* adjusted target = pool_target(BE 32B) * tile_elems*rounded_k  (kryptex object-notify dialect) */
+/* adjusted target = pool_target(BE 32B) * tile_elems*rounded_k (kryptex dialect) */
 void target_from_be(const uint8_t be[32], long tile_elems_rounded_k, uint32_t out[8]) {
     uint32_t q[8];
-    for (int i = 0; i < 8; i++)     /* BE bytes -> LE limbs */
+    for (int i = 0; i < 8; i++)
         q[i] = (uint32_t)be[31 - 4 * i] | ((uint32_t)be[30 - 4 * i] << 8)
              | ((uint32_t)be[29 - 4 * i] << 16) | ((uint32_t)be[28 - 4 * i] << 24);
     mul_limbs(q, (uint64_t)tile_elems_rounded_k, out);

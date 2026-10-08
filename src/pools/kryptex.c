@@ -1,14 +1,12 @@
 /*
- * Kryptex frontend — plain stratum, the miner chooses the rank/shape.
+ * Kryptex frontend — plain stratum, miner-chosen rank/shape.
  *
- * Wire dialect (pool.kryptex.com/prl):
- *   - handshake: subscribe + authorize only; NO pearl.challenge, NO pearl.set_mining_params.
- *     authorize alone starts the job feed.
- *   - mining.notify.params is an OBJECT {header, height, job_id, target}.
- *   - mining.submit.params is an OBJECT {worker, job_id, plain_proof}.
- *   - the noise rank / m,n,k / patterns are the MINER's choice (encoded in the proof; the pool
- *     reads them out and grades against them) -> init_params fills mp from the build macros.
- *   - adjusted target = pool_target(BE) * tile_elems * rounded_k.
+ * pool.kryptex.com/prl dialect:
+ *   - handshake: subscribe + authorize; authorize starts the job feed.
+ *   - mining.notify.params: object {header, height, job_id, target}.
+ *   - mining.submit.params: object {worker, job_id, plain_proof}.
+ *   - adjusted target: pool_target(BE) * tile_elems * rounded_k.
+ *   - type:"v2" authorize negotiates gzip-compressed proof submission.
  */
 #include "pool.h"
 #include <stdio.h>
@@ -26,7 +24,6 @@
 #endif
 
 static void k_init_params(mining_params_t *mp) {
-    /* miner-chosen; must match the linked kernel .so (K/RANK). Standard [0,32] / [0..63]. */
     mp->m = MDIM; mp->n = MDIM; mp->k = K; mp->rank = RANK;
     mp->rows[0] = 0; mp->rows[1] = 32; mp->nrows = 2;
     for (size_t i = 0; i < 64; i++) mp->cols[i] = i;
@@ -37,21 +34,13 @@ static void k_init_params(mining_params_t *mp) {
 
 static int k_open(pool_conn_t *c, const char *host, int port,
                   const char *addr, const char *worker, const char *pass, mining_params_t *mp) {
-    c->gzip = 0;                 /* clear any flag from a prior session before re-negotiating */
+    c->gzip = 0;
     if (pool_connect(c, host, port)) return -1;
     char line[LINE];
     snprintf(line, LINE, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"cminer/0.1\"]}");
     pool_send_line(c, line);
-    /* password: pass through as-is for custom share difficulty (e.g. "d=2097152" or "d=349245965").
-     * Empty / missing -> pool default. See https://gist.github.com/maxmalysh/f4c29f532e650a114b317e234f1393fb
-     * authorize with the v2 object params -> ask for gzip. If the pool echoes "type":"v2" in the
-     * ack (k_dispatch), c->gzip is set and submits go out gzipped. A pool that ignores "type"
-     * (replies without it) just keeps c->gzip=0 -> plain proof, so this stays back-compatible.
-     * A v2 session REQUIRES gzip submits (the pool gunzips), so PRL_NOGZIP must negotiate a true
-     * v1 session (no "type") — else a plain payload in a v2 session is rejected as "Invalid share".
-     * PRL_GZIP forces gzip without waiting for the ack. */
     const char *pw = (pass && *pass) ? pass : "";
-    if (getenv("PRL_NOGZIP")) {  /* explicit v1: original array-form authorize, plain proof */
+    if (getenv("PRL_NOGZIP")) {
         snprintf(line, LINE, "{\"id\":3,\"method\":\"mining.authorize\",\"params\":[\"%s.%s\",\"%s\"]}",
                  addr, worker, pw[0] ? pw : "x");
     } else {
@@ -66,9 +55,6 @@ static int k_open(pool_conn_t *c, const char *host, int port,
 }
 
 static void k_handle_notify(pool_conn_t *c, const char *line) {
-    /* params is an OBJECT: {header, height, job_id, target[, cert_version]}.
-     * cert_version is read defensively (defaults to 1) in case this pool adds it later,
-     * same as k1 -- see docs/salted-seed-fork-upgrade-guide.md upstream. */
     char jid[JOBLEN], hdr[2 * HDRLEN], tgt[80];
     if (jstr(line, "header", hdr, sizeof hdr)) return;
     if (jstr(line, "job_id", jid, sizeof jid)) return;
@@ -77,9 +63,9 @@ static void k_handle_notify(pool_conn_t *c, const char *line) {
     uint8_t ptarget[32]; int have_t = 0;
     if (!jstr(line, "target", tgt, sizeof tgt)) {
         memset(ptarget, 0, 32);
-        int tn = hex2bin(tgt, ptarget, 32);     /* up to 64 nibbles, big-endian */
+        int tn = hex2bin(tgt, ptarget, 32);
         if (tn > 0) {
-            if (tn < 32) { memmove(ptarget + (32 - tn), ptarget, tn);   /* right-align BE */
+            if (tn < 32) { memmove(ptarget + (32 - tn), ptarget, tn);
                            memset(ptarget, 0, 32 - tn); }
             have_t = 1;
         }
@@ -106,7 +92,6 @@ static void k_dispatch(pool_conn_t *c, const char *line, mining_params_t *mp) {
         if (p && *p == '[') c->job.difficulty = atof(p + 1);
         printf("[stratum]%s difficulty %.0f\n", c->tag, c->job.difficulty);
     } else if (strstr(line, "\"result\"")) {
-        /* the authorize ack carries "type":"v2" iff the pool accepted gzip for this session */
         char ty[8] = "";
         if (!jstr(line, "type", ty, sizeof ty) && !strcmp(ty, "v2") && !getenv("PRL_NOGZIP")) {
             if (!c->gzip) printf("[stratum]%s gzip proof negotiated (type:v2)\n", c->tag);
@@ -123,8 +108,6 @@ static void k_build_target(const job_t *J, int tile_h, long rounded_k, uint32_t 
 static int k_submit_prefix(pool_conn_t *c, const char *addr, const char *worker,
                            const char *job_id, char *msg, size_t cap, const char **tail) {
     *tail = "\"}}";
-    /* gzip sessions reuse the same field by default (pool gunzips the base64 payload because the
-     * session negotiated v2); PRL_GZIP_FIELD overrides the name for try-and-check (e.g. "proof"). */
     const char *field = "plain_proof";
     if (c->gzip) { const char *e = getenv("PRL_GZIP_FIELD"); if (e && *e) field = e; }
     return snprintf(msg, cap, "{\"id\":%d,\"method\":\"mining.submit\",\"params\":"

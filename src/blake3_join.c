@@ -1,8 +1,8 @@
-/* pthread implementation of blake3's parallel split hook. blake3.c (compiled -DBLAKE3_USE_TBB)
- * calls this for each left/right subtree split; we run the LEFT subtree on a helper thread and
- * the RIGHT in-place, bounded by a global concurrency budget. blake3's own tree logic is
- * unchanged => digest is bit-identical to the serial path; only WHERE the work runs changes.
- * Only large subtrees are threaded (small ones run serial to avoid pthread overhead). */
+/* pthread implementation of blake3's parallel split hook.
+ * blake3.c (compiled -DBLAKE3_USE_TBB) calls this for each left/right subtree split;
+ * we run the LEFT subtree on a helper thread and the RIGHT in-place, bounded by a
+ * global concurrency budget. Digest is bit-identical to the serial path.
+ * Small subtrees run serially to avoid pthread overhead. */
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -13,10 +13,10 @@ extern size_t blake3_compress_subtree_wide(const uint8_t *input, size_t input_le
                                            uint8_t flags, uint8_t *out, bool use_tbb);
 
 #ifndef PRL_B3_CAP
-#define PRL_B3_CAP 64            /* max concurrent helper threads */
+#define PRL_B3_CAP 64
 #endif
 #ifndef PRL_B3_MIN
-#define PRL_B3_MIN (1u << 20)    /* only thread subtrees >= 1 MB */
+#define PRL_B3_MIN (1u << 20)
 #endif
 
 static int g_budget = 0;
@@ -57,7 +57,7 @@ void blake3_compress_subtree_wide_join_tbb(
             pthread_mutex_lock(&g_bmu); g_budget--; pthread_mutex_unlock(&g_bmu);
             return;
         }
-        pthread_mutex_lock(&g_bmu); g_budget--; pthread_mutex_unlock(&g_bmu);  /* create failed -> serial */
+        pthread_mutex_lock(&g_bmu); g_budget--; pthread_mutex_unlock(&g_bmu);
     }
     *l_n = blake3_compress_subtree_wide(l_input, l_input_len, key, l_chunk_counter, flags, l_cvs, use_tbb);
     *r_n = blake3_compress_subtree_wide(r_input, r_input_len, key, r_chunk_counter, flags, r_cvs, use_tbb);
