@@ -42,7 +42,7 @@ static int k1_open(pool_conn_t *c, const char *host, int port,
 }
 
 static void k1_handle_notify(pool_conn_t *c, const char *line) {
-    char jid[JOBLEN], hdr[2 * HDRLEN], tgt[80];
+    char jid[JOBLEN], hdr[2 * HDRLEN + 1], tgt[80];
     if (jstr(line, "header", hdr, sizeof hdr)) return;
     if (jstr(line, "job_id", jid, sizeof jid)) return;
     long height = (long)jnum(line, "height", 0);
@@ -60,9 +60,14 @@ static void k1_handle_notify(pool_conn_t *c, const char *line) {
             have_t = 1;
         }
     }
+    uint8_t decoded_header[HDRLEN];
+    int decoded_len = hex2bin(hdr, decoded_header, sizeof decoded_header);
+    if (decoded_len <= 0) return;
     pthread_mutex_lock(&job_mu);
     strncpy(c->job.job_id, jid, JOBLEN - 1);
-    c->job.header_len = (size_t)hex2bin(hdr, c->job.header, HDRLEN);
+    c->job.job_id[JOBLEN - 1] = 0;
+    memcpy(c->job.header, decoded_header, (size_t)decoded_len);
+    c->job.header_len = (size_t)decoded_len;
     c->job.height = height;
     c->job.cert_version = cert_version;
     if (have_t) { memcpy(c->job.ptarget, ptarget, 32); c->job.have_target = 1; }

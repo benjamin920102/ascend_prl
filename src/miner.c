@@ -390,17 +390,31 @@ int main(int argc, char **argv) {
                     else { printf("[!] gzip proof failed (%zd), sending plain\n", gl); sc->gzip = 0; }
                 }
                 char *msg = malloc(plen + 512);
-                const char *tail;
-                int hl = POOL.submit_prefix(sc, sub_addr, worker, cur->job_id, msg, 512, &tail);
-                memcpy(msg + hl, payload, plen);
-                strcpy(msg + hl + plen, tail);
-                pool_send_line(sc, msg);
-                if (getenv("PRL_RAW")) fprintf(stderr, "[raw>] %s\n", msg);
-                free(msg);
-                shares_sub++;
-                if (g_dev_now) g_fee_sub++;
-                printf("[✓]%s share row=%ld col=%ld job=%s (%ld submitted, %ld dev)\n",
-                       g_dev_now ? " [dev]" : "", row, col, cur->job_id, shares_sub, g_fee_sub);
+                if (!msg) {
+                    fputs("[!] cannot allocate share message\n", stderr);
+                } else {
+                    const char *tail;
+                    int hl = POOL.submit_prefix(sc, sub_addr, worker, cur->job_id, msg, 512, &tail);
+                    if (hl < 0 || hl >= 512) {
+                        fputs("[!] share prefix exceeds message capacity\n", stderr);
+                    } else {
+                        size_t tail_len = strlen(tail);
+                        if ((size_t)hl + tail_len + 1 > 512) {
+                            fputs("[!] share suffix exceeds message capacity\n", stderr);
+                        } else {
+                            memcpy(msg + hl, payload, plen);
+                            memcpy(msg + hl + plen, tail, tail_len + 1);
+                            // The proof length is already known; avoid scanning it with strlen.
+                            pool_send_line_n(sc, msg, (size_t)hl + plen + tail_len);
+                            if (getenv("PRL_RAW")) fprintf(stderr, "[raw>] %s\n", msg);
+                            shares_sub++;
+                            if (g_dev_now) g_fee_sub++;
+                            printf("[✓]%s share row=%ld col=%ld job=%s (%ld submitted, %ld dev)\n",
+                                   g_dev_now ? " [dev]" : "", row, col, cur->job_id, shares_sub, g_fee_sub);
+                        }
+                    }
+                    free(msg);
+                }
             } else printf("[!] proof build failed %zd\n", bl);
         }
         double el = difftime(time(0), t_start);

@@ -57,6 +57,7 @@ extern pthread_mutex_t job_mu;
 
 void pool_conn_init(pool_conn_t *c, const char *tag);
 void pool_send_line(pool_conn_t *c, const char *s);
+void pool_send_line_n(pool_conn_t *c, const char *s, size_t len);
 int  pool_connect(pool_conn_t *c, const char *host, int port);
 void pool_start_reader(pool_conn_t *c, mining_params_t *mp);
 void pool_handle_result(pool_conn_t *c, const char *line);

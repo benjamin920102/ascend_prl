@@ -130,7 +130,6 @@ static void calc_mk(const int8_t *buf, int64_t len, const uint8_t *key, uint8_t 
 
 static void unif_int8(const uint8_t *seed, const uint8_t *key, int64_t nbytes, int8_t *out, int nt) {
     int64_t draws = (nbytes + DIGEST - 1) / DIGEST;
-    uint8_t *raw = (uint8_t *)out;
 
 #pragma omp parallel for schedule(static) num_threads(nt)
     for (int64_t i = 0; i < draws; i++) {
@@ -138,28 +137,22 @@ static void unif_int8(const uint8_t *seed, const uint8_t *key, int64_t nbytes, i
         draw_hash((uint32_t)i, seed, key, 0, d);
         int64_t off = i * DIGEST, n = nbytes - off;
         if (n > DIGEST) n = DIGEST;
-        memcpy(raw + off, d, (size_t)n);
-    }
-
+        // Transform each digest before writing it, avoiding a second pass over EAL/EBR.
 #ifdef HAVE_NEON
-    int64_t nvec = nbytes / 16;
-#pragma omp parallel for schedule(static) num_threads(nt)
-    for (int64_t v = 0; v < nvec; v++) {
-        int64_t i = v * 16;
-        uint8x16_t x = vld1q_u8(raw + i);
-        x = vandq_u8(x, vdupq_n_u8(RANGE_MASK));
-        int8x16_t sv = vsubq_s8(vreinterpretq_s8_u8(x), vdupq_n_s8(ZERO_POINT));
-        vst1q_s8(out + i, sv);
-    }
-    for (int64_t i = nvec * 16; i < nbytes; i++) {
-        out[i] = (int8_t)((raw[i] & RANGE_MASK) - ZERO_POINT);
-    }
-#else
-#pragma omp parallel for schedule(static) num_threads(nt)
-    for (int64_t i = 0; i < nbytes; i++) {
-        out[i] = (int8_t)((raw[i] & RANGE_MASK) - ZERO_POINT);
-    }
+        if (n == DIGEST) {
+            uint8x16_t mask = vdupq_n_u8(RANGE_MASK);
+            int8x16_t zero = vdupq_n_s8(ZERO_POINT);
+            uint8x16_t lo = vandq_u8(vld1q_u8(d), mask);
+            uint8x16_t hi = vandq_u8(vld1q_u8(d + 16), mask);
+            vst1q_s8(out + off, vsubq_s8(vreinterpretq_s8_u8(lo), zero));
+            vst1q_s8(out + off + 16, vsubq_s8(vreinterpretq_s8_u8(hi), zero));
+            continue;
+        }
 #endif
+        for (int64_t j = 0; j < n; j++) {
+            out[off + j] = (int8_t)((d[j] & RANGE_MASK) - ZERO_POINT);
+        }
+    }
 }
 
 // Each index pair is deterministically derived from the commitment; XOR ensures

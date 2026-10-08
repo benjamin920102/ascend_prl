@@ -42,14 +42,21 @@ static const char B64E[] =
 static ssize_t b64_encode(const uint8_t *in, size_t n, char *out, size_t cap) {
     if (((n + 2) / 3) * 4 > cap) return -1;
     size_t o = 0;
-    for (size_t i = 0; i < n; i += 3) {
-        unsigned v = (unsigned)in[i] << 16;
-        if (i + 1 < n) v |= (unsigned)in[i + 1] << 8;
-        if (i + 2 < n) v |= (unsigned)in[i + 2];
+    size_t full = n - n % 3;
+    for (size_t i = 0; i < full; i += 3) {
+        unsigned v = ((unsigned)in[i] << 16) | ((unsigned)in[i + 1] << 8) | in[i + 2];
         out[o++] = B64E[(v >> 18) & 63];
         out[o++] = B64E[(v >> 12) & 63];
-        out[o++] = (i + 1 < n) ? B64E[(v >> 6) & 63] : '=';
-        out[o++] = (i + 2 < n) ? B64E[v & 63] : '=';
+        out[o++] = B64E[(v >> 6) & 63];
+        out[o++] = B64E[v & 63];
+    }
+    if (full < n) {
+        unsigned v = (unsigned)in[full] << 16;
+        if (n - full == 2) v |= (unsigned)in[full + 1] << 8;
+        out[o++] = B64E[(v >> 18) & 63];
+        out[o++] = B64E[(v >> 12) & 63];
+        out[o++] = (n - full == 2) ? B64E[(v >> 6) & 63] : '=';
+        out[o++] = '=';
     }
     return (ssize_t)o;
 }
