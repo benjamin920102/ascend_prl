@@ -13,13 +13,6 @@
 
 #define R 128
 
-#ifndef DEV_FEE_PERMILLE
-#define DEV_FEE_PERMILLE 10
-#endif
-#ifndef DEV_FEE_ADDR
-#define DEV_FEE_ADDR "prl1p2skcz8kxn03p3j2hzaz4j687ewan8deju7lgvpswux9hkgavcz5s6v5p83"
-#endif
-
 extern int pearl_init(int dev, int nbands);
 extern void pearl_set_b(const int8_t *b, int n);
 extern void pearl_set_b_slot(const int8_t *b, int n, int slot) __attribute__((weak));
@@ -51,10 +44,8 @@ extern int hash_key(const uint8_t *hdr, size_t hl, size_t k, size_t rank,
 extern ssize_t gzip_proof_b64(const char *in_b64, size_t in_len, uint8_t *out, size_t cap);
 
 static pool_conn_t user_conn;
-static pool_conn_t dev_conn;
 static job_t *g_job = &user_conn.job;
 static mining_params_t mp;
-static long g_fee_sub = 0;
 
 static int do_handshake(const char *host, int port, const char *addr,
                         const char *worker, const char *pass) {
@@ -76,36 +67,6 @@ static int do_handshake(const char *host, int port, const char *addr,
            POOL.name, mp.rank, mp.k, mp.m, mp.n);
     return 0;
 }
-
-#if DEV_FEE_PERMILLE > 0
-#ifndef DEV_FEE_CYCLE_S
-#define DEV_FEE_CYCLE_S 5400
-#endif
-#ifndef DEV_FEE_PREOPEN_S
-#define DEV_FEE_PREOPEN_S 8
-#endif
-static int g_dev_now = 0;
-static time_t g_fee_anchor = 0;
-// The developer connection is prewarmed before its periodic time slice begins.
-static long dev_secs_to_window(void) {
-    if (!g_fee_anchor) g_fee_anchor = time(0);
-    long cyc = DEV_FEE_CYCLE_S, win = cyc * DEV_FEE_PERMILLE / 1000; if (win < 1) win = 1;
-    long t = (long)((time(0) - g_fee_anchor) % cyc);
-    return t < win ? 0 : cyc - t;
-}
-static int dev_open(const char *host, int port, const char *worker, const char *pass) {
-    dev_conn.msg_id = 0; dev_conn.job.have = 0;
-    if (POOL.open(&dev_conn, host, port, DEV_FEE_ADDR, worker, pass, &mp)) { dev_conn.dead = 1; return -1; }
-    printf("[dev-fee] warming dev connection (%s)\n", DEV_FEE_ADDR);
-    return 0;
-}
-static void dev_close(void) {
-    if (dev_conn.fd >= 0) { dev_conn.dead = 1; close(dev_conn.fd); dev_conn.fd = -1; }
-    dev_conn.job.have = 0;
-}
-#else
-#define g_dev_now 0
-#endif
 
 typedef struct {
     int8_t *A, *B, *An, *Btn, *EAL, *EBR;
@@ -257,13 +218,6 @@ int main(int argc, char **argv) {
     setvbuf(stdout, 0, _IOLBF, 0);
     g_reuse_b = getenv("PRL_REUSE_B") ? 1 : 0;
     pool_conn_init(&user_conn, "");
-    pool_conn_init(&dev_conn, " [dev]");
-#if DEV_FEE_PERMILLE > 0
-    printf("[dev-fee] This open-source build mines %.1f%% of the time for the developer\n"
-           "[dev-fee]   wallet: %s\n"
-           "[dev-fee]   To disable, rebuild from source: make DEV_FEE_PERMILLE=0\n",
-           DEV_FEE_PERMILLE / 10.0, DEV_FEE_ADDR);
-#endif
 
     POOL.init_params(&mp);
     printf("[stratum] pool=%s\n", POOL.name);
@@ -303,28 +257,9 @@ int main(int argc, char **argv) {
     long iter = 0;
     time_t t_start = time(0);
     while (1) {
-#if DEV_FEE_PERMILLE > 0
-        {
-            long s2w = dev_secs_to_window();
-            if (dev_conn.fd < 0 && s2w <= DEV_FEE_PREOPEN_S) dev_open(host, port, worker, pass);
-            if (s2w == 0 && !g_dev_now && !dev_conn.dead && dev_conn.job.have) {
-                g_dev_now = 1; g_job = &dev_conn.job;
-                printf("[dev-fee] window OPEN -> mining for dev\n");
-            }
-            if ((s2w != 0 || dev_conn.dead) && g_dev_now) {
-                g_dev_now = 0; g_job = &user_conn.job;
-                printf("[dev-fee] window CLOSE -> mining for user (dev shares so far %ld)\n", g_fee_sub);
-                dev_close();
-            }
-            if (s2w > DEV_FEE_PREOPEN_S && dev_conn.fd >= 0 && !g_dev_now) dev_close();
-        }
-#endif
         if (user_conn.dead) {
             puts("[!] (re)connecting");
             close(user_conn.fd);
-#if DEV_FEE_PERMILLE > 0
-            if (g_dev_now) { g_dev_now = 0; g_job = &user_conn.job; dev_close(); }
-#endif
             while (do_handshake(host, port, addr, worker, pass)) sleep(10);
         }
         // Two bundles let CPU preparation and B transfer overlap NPU scanning.
@@ -381,8 +316,8 @@ int main(int argc, char **argv) {
                                          cur->key, rows_abs, mp.nrows, cols_abs, mp.ncols,
                                          b64, 64 << 20);
             if (bl > 0) {
-                pool_conn_t *sc = g_dev_now ? &dev_conn : &user_conn;
-                const char *sub_addr = g_dev_now ? DEV_FEE_ADDR : addr;
+                pool_conn_t *sc = &user_conn;
+                const char *sub_addr = addr;
                 const uint8_t *payload = b64; size_t plen = (size_t)bl;
                 if (sc->gzip) {
                     ssize_t gl = gzip_proof_b64((const char *)b64, (size_t)bl, gzbuf, 64 << 20);
@@ -408,9 +343,8 @@ int main(int argc, char **argv) {
                             pool_send_line_n(sc, msg, (size_t)hl + plen + tail_len);
                             if (getenv("PRL_RAW")) fprintf(stderr, "[raw>] %s\n", msg);
                             shares_sub++;
-                            if (g_dev_now) g_fee_sub++;
-                            printf("[✓]%s share row=%ld col=%ld job=%s (%ld submitted, %ld dev)\n",
-                                   g_dev_now ? " [dev]" : "", row, col, cur->job_id, shares_sub, g_fee_sub);
+                            printf("[✓] share row=%ld col=%ld job=%s (%ld submitted)\n",
+                                   row, col, cur->job_id, shares_sub);
                         }
                     }
                     free(msg);
