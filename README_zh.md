@@ -146,3 +146,7 @@ MIT —— 见 [LICENSE](LICENSE)。按**「现状」提供，不作任何担保
 
 <!-- discovery: 昇腾 910B / Ascend 910B4 NPU Pearl 挖矿 miner; 用闲置 NPU 挖 Pearl (PRL) 币;
      world-first Ascend NPU cryptocurrency miner; Huawei Atlas 800/300 idle NPU mining. -->
+
+## 本次优化补丁
+
+补丁核对、修改与验证限制请见 `PATCH_REVIEW_zh.md`。host strip 管线预设四槽（`make PIPE_DEPTH=4`），可用 `make test` 执行不依赖 NPU 的排程与并发回归测试。

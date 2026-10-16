@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 extern size_t blake3_compress_subtree_wide(const uint8_t *input, size_t input_len,
                                            const uint32_t key[8], uint64_t chunk_counter,
@@ -18,8 +19,18 @@ extern size_t blake3_compress_subtree_wide(const uint8_t *input, size_t input_le
 #define PRL_B3_MIN (1u << 20)
 #endif
 
-static int g_budget = 0;
-static pthread_mutex_t g_bmu = PTHREAD_MUTEX_INITIALIZER;
+// This counter only limits helpers; pthread_create/join publish the actual data.
+static _Atomic int g_budget = 0;
+
+static int reserve_helper(void) {
+    int old = atomic_load_explicit(&g_budget, memory_order_relaxed);
+    while (old < PRL_B3_CAP) {
+        if (atomic_compare_exchange_weak_explicit(&g_budget, &old, old + 1,
+                memory_order_relaxed, memory_order_relaxed))
+            return 1;
+    }
+    return 0;
+}
 
 typedef struct {
     const uint8_t *input; size_t input_len; const uint32_t *key;
@@ -42,9 +53,7 @@ void blake3_compress_subtree_wide_join_tbb(
 {
     int spawn = 0;
     if (use_tbb && l_input_len >= PRL_B3_MIN) {
-        pthread_mutex_lock(&g_bmu);
-        if (g_budget < PRL_B3_CAP) { g_budget++; spawn = 1; }
-        pthread_mutex_unlock(&g_bmu);
+        spawn = reserve_helper();
     }
     // If creating the helper fails, release the reserved budget and run serially.
     if (spawn) {
@@ -54,10 +63,10 @@ void blake3_compress_subtree_wide_join_tbb(
             *r_n = blake3_compress_subtree_wide(r_input, r_input_len, key,
                                                 r_chunk_counter, flags, r_cvs, use_tbb);
             pthread_join(t, 0);
-            pthread_mutex_lock(&g_bmu); g_budget--; pthread_mutex_unlock(&g_bmu);
+            atomic_fetch_sub_explicit(&g_budget, 1, memory_order_relaxed);
             return;
         }
-        pthread_mutex_lock(&g_bmu); g_budget--; pthread_mutex_unlock(&g_bmu);
+        atomic_fetch_sub_explicit(&g_budget, 1, memory_order_relaxed);
     }
     *l_n = blake3_compress_subtree_wide(l_input, l_input_len, key, l_chunk_counter, flags, l_cvs, use_tbb);
     *r_n = blake3_compress_subtree_wide(r_input, r_input_len, key, r_chunk_counter, flags, r_cvs, use_tbb);

@@ -143,3 +143,7 @@ MIT — see [LICENSE](LICENSE). Provided **as-is, without warranty**.
 
 <!-- discovery: 昇腾 910B / Ascend 910B4 NPU Pearl 挖矿 miner; 用闲置 NPU 挖 Pearl (PRL) 币;
      world-first Ascend NPU cryptocurrency miner; Huawei Atlas 800/300 idle NPU mining. -->
+
+## Reviewed optimization patch
+
+See `PATCH_REVIEW_zh.md` for the patch review, validation scope, and hardware limitations. The host strip queue defaults to four slots (`make PIPE_DEPTH=4`); portable scheduling/concurrency regression tests run with `make test`.
