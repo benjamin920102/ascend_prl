@@ -36,7 +36,7 @@ CC   := gcc
 CFLAGS := -std=gnu11 -O3 -fopenmp -march=armv8-a+crypto -DBLAKE3_USE_NEON=1 -DBLAKE3_USE_TBB -DK=$(K) -DRANK=$(RANK) -DMDIM=$(MDIM) -DPEARL_PIPE_DEPTH=$(PIPE_DEPTH) -I$(BLK)
 RPATH  := -Wl,-rpath,'$$ORIGIN'
 
-.PHONY: all miner kernel proof guard clean test
+.PHONY: all miner kernel proof guard clean
 all: kernel proof miner
 
 $(OUT):
@@ -69,7 +69,3 @@ proof: $(OUT)
 
 clean:
 	rm -rf $(OUT) kernel/build proof-ffi/target
-
-# Portable regression tests; no CANN/NPU or external BLAKE3 dependency.
-test:
-	CC="$(CC)" sh tests/run.sh

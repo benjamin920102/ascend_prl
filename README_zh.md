@@ -149,4 +149,4 @@ MIT —— 见 [LICENSE](LICENSE)。按**「现状」提供，不作任何担保
 
 ## 本次优化补丁
 
-补丁核对、修改与验证限制请见 `PATCH_REVIEW_zh.md`。host strip 管线预设四槽（`make PIPE_DEPTH=4`），可用 `make test` 执行不依赖 NPU 的排程与并发回归测试。
+memset／spin 修改、CANN 官方依据与验证限制请见 `PATCH_REVIEW_zh.md`。host strip 管线预设四槽（`make PIPE_DEPTH=4`）。本压缩包依要求不附 CPU 回归测试或实机测试工具。
