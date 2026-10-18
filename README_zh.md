@@ -149,4 +149,4 @@ MIT —— 见 [LICENSE](LICENSE)。按**「现状」提供，不作任何担保
 
 ## 本次优化补丁
 
-memset／spin 修改、CANN 官方依据与验证限制请见 `PATCH_REVIEW_zh.md`。host strip 管线预设六槽（`make PIPE_DEPTH=6 BUFS=6 BACKOFF=200`）。本压缩包依要求不附 CPU 回归测试或实机测试工具。
+memset／spin 修改、CANN 官方依据与验证限制请见 `PATCH_REVIEW_zh.md`。host strip 管线预设四槽（`make PIPE_DEPTH=4`）。本压缩包依要求不附 CPU 回归测试或实机测试工具。

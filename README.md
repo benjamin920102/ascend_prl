@@ -146,4 +146,4 @@ MIT — see [LICENSE](LICENSE). Provided **as-is, without warranty**.
 
 ## Reviewed optimization patch
 
-See `PATCH_REVIEW_zh.md` for the memset/spin changes, official CANN references, validation scope, and hardware limitations. The host strip queue defaults to six slots (`make PIPE_DEPTH=6 BUFS=6 BACKOFF=200`). Test sources and device test tools are intentionally excluded from this archive.
+See `PATCH_REVIEW_zh.md` for the memset/spin changes, official CANN references, validation scope, and hardware limitations. The host strip queue defaults to four slots (`make PIPE_DEPTH=4`). Test sources and device test tools are intentionally excluded from this archive.
