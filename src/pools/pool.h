@@ -2,7 +2,6 @@
 #ifndef PEARL_POOL_H
 #define PEARL_POOL_H
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -32,13 +31,11 @@ typedef struct {
 typedef struct {
     int fd;
     pthread_mutex_t send_mu;
-    _Atomic int dead;
-    _Atomic int msg_id;
-    pthread_t reader;
-    int reader_started;
+    volatile int dead;
+    int msg_id;
     job_t job;
     const char *tag;
-    _Atomic int gzip;           /* Kryptex v2 uses gzip-compressed proofs. */
+    int gzip;           /* Kryptex v2 uses gzip-compressed proofs. */
 } pool_conn_t;
 
 typedef struct {
@@ -55,13 +52,11 @@ typedef struct {
 
 extern const pool_frontend_t POOL;
 
-extern _Atomic long shares_sub, shares_acc, shares_rej;
+extern long shares_sub, shares_acc, shares_rej;
 extern pthread_mutex_t job_mu;
 
 void pool_conn_init(pool_conn_t *c, const char *tag);
 void pool_send_line(pool_conn_t *c, const char *s);
-int pool_send_line_checked(pool_conn_t *c, const char *s, size_t len);
-void pool_stop_reader(pool_conn_t *c);
 void pool_send_line_n(pool_conn_t *c, const char *s, size_t len);
 int  pool_connect(pool_conn_t *c, const char *host, int port);
 void pool_start_reader(pool_conn_t *c, mining_params_t *mp);

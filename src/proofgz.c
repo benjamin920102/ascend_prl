@@ -27,11 +27,7 @@ extern int deflateEnd(z_stream_min *);
 static ssize_t gz_compress(const uint8_t *in, size_t n, uint8_t *out, size_t cap) {
     z_stream_min s;
     memset(&s, 0, sizeof s);
-    // Level 1 minimizes share latency; PRL_GZIP_LEVEL=6 restores the old ratio.
-    const char *level_env = getenv("PRL_GZIP_LEVEL");
-    int level = level_env ? atoi(level_env) : 1;
-    if (level < 0 || level > 9) return -1;
-    if (deflateInit2_(&s, level, Z_DEFLATED, 31, 8, 0, ZLIB_VERSION, (int)sizeof s) != Z_OK) return -1;
+    if (deflateInit2_(&s, 6, Z_DEFLATED, 31, 8, 0, ZLIB_VERSION, (int)sizeof s) != Z_OK) return -1;
     s.next_in = in;   s.avail_in  = (unsigned)n;
     s.next_out = out; s.avail_out = (unsigned)cap;
     int r = deflate(&s, Z_FINISH);
