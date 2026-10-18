@@ -1,17 +1,20 @@
 /* Stratum transport, response handling, and 256-bit share-target arithmetic. */
 #include "pool.h"
 #include <netdb.h>
+#include <errno.h>
+#include <sys/time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-long shares_sub = 0, shares_acc = 0, shares_rej = 0;
+_Atomic long shares_sub = 0, shares_acc = 0, shares_rej = 0;
 pthread_mutex_t job_mu = PTHREAD_MUTEX_INITIALIZER;
 
 void pool_conn_init(pool_conn_t *c, const char *tag) {
     c->fd = -1;
+    c->reader_started = 0;
     c->dead = 1;
     c->msg_id = 0;
     c->tag = tag;
@@ -26,15 +29,27 @@ void pool_send_line(pool_conn_t *c, const char *s) {
 }
 
 void pool_send_line_n(pool_conn_t *c, const char *s, size_t len) {
+    (void)pool_send_line_checked(c, s, len);
+}
+
+int pool_send_line_checked(pool_conn_t *c, const char *s, size_t len) {
     pthread_mutex_lock(&c->send_mu);
+    if (c->dead) { pthread_mutex_unlock(&c->send_mu); return -1; }
     size_t off = 0;
     while (off < len) {
         ssize_t w = write(c->fd, s + off, len - off);
+        if (w < 0 && errno == EINTR) continue;
         if (w <= 0) { c->dead = 1; break; }
         off += (size_t)w;
     }
-    if (!c->dead && write(c->fd, "\n", 1) != 1) c->dead = 1;
+    if (!c->dead) {
+        ssize_t w;
+        do { w = write(c->fd, "\n", 1); } while (w < 0 && errno == EINTR);
+        if (w != 1) c->dead = 1;
+    }
+    int rc = c->dead ? -1 : 0;
     pthread_mutex_unlock(&c->send_mu);
+    return rc;
 }
 
 int pool_connect(pool_conn_t *c, const char *host, int port) {
@@ -43,9 +58,12 @@ int pool_connect(pool_conn_t *c, const char *host, int port) {
     char ps[16]; snprintf(ps, 16, "%d", port);
     if (getaddrinfo(host, ps, &hints, &ai)) return -1;
     c->fd = socket(ai->ai_family, SOCK_STREAM, 0);
-    if (connect(c->fd, ai->ai_addr, ai->ai_addrlen)) { freeaddrinfo(ai); c->fd = -1; return -1; }
+    if (c->fd < 0 || connect(c->fd, ai->ai_addr, ai->ai_addrlen)) { if (c->fd >= 0) close(c->fd); freeaddrinfo(ai); c->fd = -1; return -1; }
     freeaddrinfo(ai);
     int one = 1; setsockopt(c->fd, SOL_SOCKET, SO_KEEPALIVE, &one, 4);
+    // Bound a stalled background submission so buffer reuse can eventually proceed.
+    struct timeval send_timeout = {10, 0};
+    setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof send_timeout);
     c->dead = 0;
     return 0;
 }
@@ -82,7 +100,19 @@ static void *reader_thread(void *arg) {
 void pool_start_reader(pool_conn_t *c, mining_params_t *mp) {
     reader_arg_t *ra = malloc(sizeof *ra);
     ra->c = c; ra->mp = mp;
-    pthread_t t; pthread_create(&t, 0, reader_thread, ra); pthread_detach(t);
+    if (pthread_create(&c->reader, 0, reader_thread, ra)) {
+        free(ra); c->dead = 1;
+    } else c->reader_started = 1;
+}
+
+/* Call only after pending proof submissions have drained. Join the old reader
+ * before reopening a session, so it cannot touch the new socket/job state. */
+void pool_stop_reader(pool_conn_t *c) {
+    c->dead = 1;
+    if (c->fd >= 0) shutdown(c->fd, SHUT_RDWR);
+    if (c->reader_started) { pthread_join(c->reader, 0); c->reader_started = 0; }
+    if (c->fd >= 0) close(c->fd);
+    c->fd = -1;
 }
 
 void pool_handle_result(pool_conn_t *c, const char *line) {
