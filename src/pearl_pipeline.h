@@ -9,12 +9,6 @@
 #endif
 
 #include <stdint.h>
-#ifndef PEARL_BAND_GROUP
-#define PEARL_BAND_GROUP 2
-#endif
-#if PEARL_BAND_GROUP != 1 && PEARL_BAND_GROUP != 2
-#error "PEARL_BAND_GROUP must be 1 or 2"
-#endif
 /* Each vector block owns one 64-byte region, including an explicit no-hit result.
  * Keep these constants identical in the host and device translation units. */
 #define PEARL_GRID 20

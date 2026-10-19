@@ -3,8 +3,6 @@
 #include <string.h>
 #include <omp.h>
 #include "blake3.h"
-#include "prep_state.h"
-#include "pearl_pipeline.h"
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
@@ -91,7 +89,7 @@ static void draw_hash(uint32_t idx, const uint8_t *seed, const uint8_t *key,
  * Default: zero-fill + 8-byte seed stamp (gzip-friendly; ~10-100x compression on proofs).
  * PRL_ZERO_SEED=0: legacy uniform random fill (incompressible).
  */
-static void fill_buf(int8_t *buf, int64_t total, uint64_t seed, int nt, prep_seed_state *state) {
+static void fill_buf(int8_t *buf, int64_t total, uint64_t seed, int nt) {
     const char *zs = getenv("PRL_ZERO_SEED");
     if (zs && zs[0] == '0' && zs[1] == '\0') {
 #pragma omp parallel num_threads(nt)
@@ -108,18 +106,9 @@ static void fill_buf(int8_t *buf, int64_t total, uint64_t seed, int nt, prep_see
                     buf[i++] = (int8_t)((uint8_t)v % 127) - 63;
             }
         }
-        // A later switch back to zero mode must clear the random contents.
-        if (state) state->zero_valid = 0;
         return;
     }
-    // State belongs to this exact allocation; generic APIs pass NULL.
-    if (!state || !state->zero_valid || state->buffer != buf || state->size != total)
-        memset(buf, 0, (size_t)total);
-    if (state) {
-        state->buffer = buf;
-        state->size = total;
-        state->zero_valid = 1;
-    }
+    memset(buf, 0, (size_t)total);
     if (total >= 8) {
         uint64_t s = seed;
         for (int i = 0; i < 8; i++, s >>= 8)
@@ -187,26 +176,6 @@ static void perm_pairs(const uint8_t *seed, const uint8_t *key, int64_t lines, i
     }
 }
 
-#ifdef HAVE_NEON
-/* Rank-128 gather uses two 64-byte NEON tables. Out-of-range TBL lanes
- * are zero, so OR joins the two disjoint index ranges exactly. */
-typedef struct { uint8x16x4_t lo, hi; } rank128_table;
-static inline rank128_table load_rank128(const int8_t *row) {
-    rank128_table t;
-    for (int i = 0; i < 4; ++i) {
-        t.lo.val[i] = vld1q_u8((const uint8_t *)row + i * 16);
-        t.hi.val[i] = vld1q_u8((const uint8_t *)row + 64 + i * 16);
-    }
-    return t;
-}
-static inline int8x16_t gather_rank128(rank128_table t, const uint16_t *idx) {
-    uint8x16_t ix = vcombine_u8(vmovn_u16(vld1q_u16(idx)),
-                               vmovn_u16(vld1q_u16(idx + 8)));
-    return vreinterpretq_s8_u8(vorrq_u8(vqtbl4q_u8(t.lo, ix),
-        vqtbl4q_u8(t.hi, vsubq_u8(ix, vdupq_n_u8(64)))));
-}
-#endif
-
 static void compute_an(const int8_t *A, const int8_t *EAL, int8_t *out,
                        const uint16_t *f, const uint16_t *s,
                        int64_t m, int64_t k, int R, int nt) {
@@ -216,14 +185,6 @@ static void compute_an(const int8_t *A, const int8_t *EAL, int8_t *out,
         int8_t *o = out + r * k;
         int64_t j = 0;
 #ifdef HAVE_NEON
-        if (R == 128) {
-            rank128_table table = load_rank128(el);
-            for (; j + 16 <= k; j += 16) {
-                int8x16_t vf = gather_rank128(table, f + j);
-                int8x16_t vs = gather_rank128(table, s + j);
-                vst1q_s8(o + j, vsubq_s8(vaddq_s8(vld1q_s8(ar + j), vf), vs));
-            }
-        }
         int8_t efb[16], esb[16];
         for (; j + 16 <= k; j += 16) {
             for (int t = 0; t < 16; t++) {
@@ -262,42 +223,21 @@ static void compute_bn(const int8_t *B, const int8_t *EBR, int8_t *out,
 }
 
 #define BN_PACK 64
-// Pack noised B as [group][fold][group-column][k]. Adjacent 64-column
-// bands share one Matmul; the last group is zero-padded without extra hashes.
+// Pack the noised B matrix by 64-column band and rank-sized fold, matching the
+// NPU cube kernel's [band][fold][column][k] access order.
 static void compute_bn_pack(const int8_t *B, const int8_t *EBR, int8_t *bt,
                             const uint16_t *f, const uint16_t *s,
                             int64_t k, int64_t n, int R, int nt) {
-    const int64_t group_cols = BN_PACK * PEARL_BAND_GROUP;
-    int64_t nbands = (n + group_cols - 1) / group_cols, NFOLD = k / R;
+    int64_t nbands = n / BN_PACK, NFOLD = k / R;
 #pragma omp parallel for schedule(static) num_threads(nt)
     for (int64_t jp = 0; jp < nbands; jp++) {
-        for (int64_t m = 0; m < group_cols; m++) {
-            int64_t col = jp * group_cols + m;
-            if (col >= n) {
-                for (int64_t p = 0; p < NFOLD; ++p)
-                    memset(bt + ((jp * NFOLD + p) * group_cols + m) * R, 0, (size_t)R);
-                continue;
-            }
-            const int8_t *bcol = B + col * k;
-            const int8_t *ecol = EBR + col * R;
-#ifdef HAVE_NEON
-            rank128_table table;
-            if (R == 128) table = load_rank128(ecol);
-#endif
-            for (int64_t p = 0; p < NFOLD; p++) {
-                int8_t *dst = bt + ((jp * NFOLD + p) * group_cols + m) * R;
-                int64_t ki = 0;
-#ifdef HAVE_NEON
-                if (R == 128) {
-                    for (; ki + 16 <= R; ki += 16) {
-                        int64_t row = p * R + ki;
-                        int8x16_t vf = gather_rank128(table, f + row);
-                        int8x16_t vs = gather_rank128(table, s + row);
-                        vst1q_s8(dst + ki, vsubq_s8(vaddq_s8(vld1q_s8(bcol + row), vf), vs));
-                    }
-                }
-#endif
-                for (; ki < R; ki++) {
+        for (int64_t p = 0; p < NFOLD; p++) {
+            for (int64_t m = 0; m < BN_PACK; m++) {
+                int64_t col = jp * BN_PACK + m;
+                const int8_t *bcol = B + col * k;
+                const int8_t *ecol = EBR + col * R;
+                int8_t *dst = bt + ((jp * NFOLD + p) * BN_PACK + m) * R;
+                for (int64_t ki = 0; ki < R; ki++) {
                     int64_t row = p * R + ki;
                     dst[ki] = (int8_t)(bcol[row] + ecol[f[row]] - ecol[s[row]]);
                 }
@@ -365,10 +305,9 @@ static int prep_random_impl(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *
                             int64_t m, int64_t n, int64_t k, int R,
                             int8_t *A_noised, int8_t *Bt_out, int8_t *EAL, int8_t *EBR,
                             uint8_t *rootA, uint8_t *rootB, uint8_t *commitA, uint8_t *commitB,
-                            int nt, int pack, int cert_mode,
-                            prep_seed_state *as, prep_seed_state *bs) {
-    fill_buf(A, m * k, seed, nt, as);
-    fill_buf(B, n * k, seed ^ 0xB0B0B0B0ULL, nt, bs);
+                            int nt, int pack, int cert_mode) {
+    fill_buf(A, m * k, seed, nt);
+    fill_buf(B, n * k, seed ^ 0xB0B0B0B0ULL, nt);
     return prep_from_ab_impl(A, B, key, m, n, k, R, A_noised, Bt_out,
                              EAL, EBR, rootA, rootB, commitA, commitB, nt, pack, cert_mode);
 }
@@ -380,7 +319,7 @@ int prep_random(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *key,
                 int nt, int cert_version) {
     int cert_mode = cert_version >= 3 ? CERT_SALTED : CERT_LEGACY;
     return prep_random_impl(seed, A, B, key, m, n, k, R, A_noised, Bt_noised,
-                            EAL, EBR, rootA, rootB, commitA, commitB, nt, 0, cert_mode, NULL, NULL);
+                            EAL, EBR, rootA, rootB, commitA, commitB, nt, 0, cert_mode);
 }
 
 int prep_random_bt(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *key,
@@ -390,17 +329,17 @@ int prep_random_bt(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *key,
                 int nt, int cert_version) {
     int cert_mode = cert_version >= 3 ? CERT_SALTED : CERT_LEGACY;
     return prep_random_impl(seed, A, B, key, m, n, k, R, A_noised, bt_packed,
-                            EAL, EBR, rootA, rootB, commitA, commitB, nt, 1, cert_mode, NULL, NULL);
+                            EAL, EBR, rootA, rootB, commitA, commitB, nt, 1, cert_mode);
 }
 
-int prep_b_side_cached(uint64_t seed, int8_t *B, const uint8_t *key,
+int prep_b_side(uint64_t seed, int8_t *B, const uint8_t *key,
                 int64_t n, int64_t k, int R,
                 int8_t *bt_packed, int8_t *EBR, uint8_t *rootB, uint8_t *commitB,
-                int nt, int cert_version, prep_seed_state *state) {
+                int nt, int cert_version) {
     if ((n * k) % 1024) return -1;
     if (k > (1 << 16)) return -2;
 
-    fill_buf(B, n * k, seed, nt, state);
+    fill_buf(B, n * k, seed, nt);
     calc_mk(B, n * k, key, rootB);
 
     int cert_mode = cert_version >= 3 ? CERT_SALTED : CERT_LEGACY;
@@ -422,14 +361,14 @@ int prep_b_side_cached(uint64_t seed, int8_t *B, const uint8_t *key,
     return 0;
 }
 
-int prep_a_side_cached(uint64_t seed, int8_t *A, const uint8_t *key, const uint8_t *commitB,
+int prep_a_side(uint64_t seed, int8_t *A, const uint8_t *key, const uint8_t *commitB,
                 int64_t m, int64_t k, int R,
                 int8_t *A_noised, int8_t *EAL, uint8_t *rootA, uint8_t *commitA,
-                int nt, int cert_version, prep_seed_state *state) {
+                int nt, int cert_version) {
     if ((m * k) % 1024) return -1;
     if (k > (1 << 16)) return -2;
 
-    fill_buf(A, m * k, seed, nt, state);
+    fill_buf(A, m * k, seed, nt);
     calc_mk(A, m * k, key, rootA);
 
     int cert_mode = cert_version >= 3 ? CERT_SALTED : CERT_LEGACY;
@@ -449,30 +388,4 @@ int prep_a_side_cached(uint64_t seed, int8_t *A, const uint8_t *key, const uint8
 
     compute_an(A, EAL, A_noised, fA, sA, m, k, R, nt);
     return 0;
-}
-
-int prep_a_side(uint64_t seed, int8_t *A, const uint8_t *key, const uint8_t *commitB,
-                int64_t m, int64_t k, int R,
-                int8_t *A_noised, int8_t *EAL, uint8_t *rootA, uint8_t *commitA,
-                int nt, int cert_version) {
-    return prep_a_side_cached(seed, A, key, commitB, m, k, R, A_noised, EAL, rootA, commitA, nt, cert_version, NULL);
-}
-
-int prep_b_side(uint64_t seed, int8_t *B, const uint8_t *key,
-                int64_t n, int64_t k, int R,
-                int8_t *bt_packed, int8_t *EBR, uint8_t *rootB, uint8_t *commitB,
-                int nt, int cert_version) {
-    return prep_b_side_cached(seed, B, key, n, k, R, bt_packed, EBR, rootB, commitB, nt, cert_version, NULL);
-}
-
-// Explicit caller-owned state avoids unsafe process-global pointer caches.
-int prep_random_cached(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *key,
-                int64_t m, int64_t n, int64_t k, int R,
-                int8_t *An, int8_t *Bt, int8_t *EAL, int8_t *EBR,
-                uint8_t *rA, uint8_t *rB, uint8_t *cA, uint8_t *cB,
-                int nt, int cert_version, int pack,
-                prep_seed_state *as, prep_seed_state *bs) {
-    int mode = cert_version >= 3 ? CERT_SALTED : CERT_LEGACY;
-    return prep_random_impl(seed, A, B, key, m, n, k, R, An, Bt, EAL, EBR,
-                            rA, rB, cA, cB, nt, pack, mode, as, bs);
 }
