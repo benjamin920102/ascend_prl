@@ -2,6 +2,7 @@
  * Usage: ascend_prl_<pool> <devid> <worker> <host> <port> <address> <password>
  */
 #include "pools/pool.h"
+#include "prep_state.h"
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -71,6 +72,7 @@ static int do_handshake(const char *host, int port, const char *addr,
 
 typedef struct {
     int8_t *A, *B, *An, *Btn, *EAL, *EBR;
+    prep_seed_state a_seed, b_seed;
     uint8_t roots[4][32];
     uint8_t key[32];
     char job_id[JOBLEN];
@@ -123,6 +125,7 @@ static int g_reuse_b = 0;
 static int8_t *g_EAL = 0;
 static struct {
     int8_t *B, *bt;
+    prep_seed_state seed_state;
     int8_t *EBR;
     uint8_t key[32], commitB[32], rootB[32];
     char job_id[JOBLEN];
@@ -149,7 +152,7 @@ static int ensure_bside(long N, long Kc, int rank, int prep_n) {
     bs.cert_version = cert_version;
     hash_key(hdr, hl, (size_t)Kc, (size_t)rank, mp.rows, mp.nrows, mp.cols, mp.ncols, bs.key);
     uint64_t seed = ((uint64_t)rand() << 32) ^ (uint64_t)time(0) ^ 0xB5B5ULL;
-    prep_check(prep_b_side(seed, bs.B, bs.key, N, Kc, rank, bs.bt, bs.EBR, bs.rootB, bs.commitB, prep_n, cert_version));
+    prep_check(prep_b_side_cached(seed, bs.B, bs.key, N, Kc, rank, bs.bt, bs.EBR, bs.rootB, bs.commitB, prep_n, cert_version, &bs.seed_state));
     if (pearl_set_bt_slot)     pearl_set_bt_slot(bs.bt, 0);
     else if (pearl_set_b_slot) pearl_set_b_slot(bs.bt, (int)N, 0);
     bs.slot = 0; bs.valid = 1; bs.since = 0;
@@ -168,8 +171,8 @@ static void *prep_worker(void *p) {
         snprintf(b->job_id, JOBLEN, "%s", bs.job_id);
         b->diff = bs.diff; memcpy(b->ptarget, bs.ptarget, 32); memcpy(b->key, bs.key, 32);
         b->cert_version = bs.cert_version;
-        prep_check(prep_a_side(seed, b->A, bs.key, bs.commitB, mp.m, mp.k, (int)mp.rank,
-                    b->An, g_EAL, b->roots[0], b->roots[2], prep_n, bs.cert_version));
+        prep_check(prep_a_side_cached(seed, b->A, bs.key, bs.commitB, mp.m, mp.k, (int)mp.rank,
+                    b->An, g_EAL, b->roots[0], b->roots[2], prep_n, bs.cert_version, &b->a_seed));
         clock_gettime(CLOCK_MONOTONIC, &pb);
         g_last_prep_ms = (pb.tv_sec - pa.tv_sec) * 1000 + (pb.tv_nsec - pa.tv_nsec) / 1000000;
         return 0;
@@ -187,13 +190,15 @@ static void *prep_worker(void *p) {
     uint64_t seed = ((uint64_t)rand() << 32) ^ (uint64_t)time(0);
     int prep_n = getenv("PRL_PREP_THREADS") ? atoi(getenv("PRL_PREP_THREADS")) : 64;
     if (pearl_set_bt_slot) {
-        prep_check(prep_random_bt(seed, b->A, b->B, b->key, mp.m, mp.n, mp.k, (int)mp.rank,
+        prep_check(prep_random_cached(seed, b->A, b->B, b->key, mp.m, mp.n, mp.k, (int)mp.rank,
                        b->An, b->Btn, b->EAL, b->EBR,
-                       b->roots[0], b->roots[1], b->roots[2], b->roots[3], prep_n, b->cert_version));
+                       b->roots[0], b->roots[1], b->roots[2], b->roots[3], prep_n, b->cert_version,
+                       1, &b->a_seed, &b->b_seed));
     } else {
-        prep_check(prep_random(seed, b->A, b->B, b->key, mp.m, mp.n, mp.k, (int)mp.rank,
+        prep_check(prep_random_cached(seed, b->A, b->B, b->key, mp.m, mp.n, mp.k, (int)mp.rank,
                     b->An, b->Btn, b->EAL, b->EBR,
-                    b->roots[0], b->roots[1], b->roots[2], b->roots[3], prep_n, b->cert_version));
+                    b->roots[0], b->roots[1], b->roots[2], b->roots[3], prep_n, b->cert_version,
+                       0, &b->a_seed, &b->b_seed));
     }
     clock_gettime(CLOCK_MONOTONIC, &pb);
     g_last_prep_ms = (pb.tv_sec - pa.tv_sec) * 1000 + (pb.tv_nsec - pa.tv_nsec) / 1000000;
@@ -371,15 +376,20 @@ int main(int argc, char **argv) {
     bundle_t bun[2] = {0};
     for (int i = 0; i < 2; i++) {
         bun[i].slot = i;
-        bun[i].A = malloc((size_t)M * Kc); bun[i].B = malloc((size_t)N * Kc);
+        bun[i].A = malloc((size_t)M * Kc);
+        if (!g_reuse_b) bun[i].B = malloc((size_t)N * Kc);
         bun[i].An = pearl_pinned_alloc ? (int8_t *)pearl_pinned_alloc((size_t)M * Kc)
                                        : (int8_t *)malloc((size_t)M * Kc);
-        bun[i].Btn = pearl_pinned_alloc ? pearl_pinned_alloc((size_t)Kc * N)
-                                       : malloc((size_t)Kc * N);
-        bun[i].EAL = malloc((size_t)M * mp.rank); bun[i].EBR = malloc((size_t)N * mp.rank);
+        if (!g_reuse_b) {
+            bun[i].Btn = pearl_pinned_alloc ? pearl_pinned_alloc((size_t)Kc * N)
+                                           : malloc((size_t)Kc * N);
+            bun[i].EAL = malloc((size_t)M * mp.rank);
+            bun[i].EBR = malloc((size_t)N * mp.rank);
+        }
     }
     for (int i = 0; i < 2; ++i) {
-        if (!bun[i].A || !bun[i].B || !bun[i].An || !bun[i].Btn || !bun[i].EAL || !bun[i].EBR) {
+        if (!bun[i].A || !bun[i].An ||
+            (!g_reuse_b && (!bun[i].B || !bun[i].Btn || !bun[i].EAL || !bun[i].EBR))) {
             fputs("[!] bundle allocation failed\n", stderr); return 2;
         }
     }
@@ -423,8 +433,8 @@ int main(int argc, char **argv) {
             int prep_n = getenv("PRL_PREP_THREADS") ? atoi(getenv("PRL_PREP_THREADS")) : 64;
             if (ensure_bside(N, Kc, (int)mp.rank, prep_n)) {
                 uint64_t s = ((uint64_t)rand() << 32) ^ (uint64_t)time(0) ^ 0xA5A5ULL;
-                prep_check(prep_a_side(s, cur->A, bs.key, bs.commitB, mp.m, mp.k, (int)mp.rank,
-                            cur->An, g_EAL, cur->roots[0], cur->roots[2], prep_n, bs.cert_version));
+                prep_check(prep_a_side_cached(s, cur->A, bs.key, bs.commitB, mp.m, mp.k, (int)mp.rank,
+                            cur->An, g_EAL, cur->roots[0], cur->roots[2], prep_n, bs.cert_version, &cur->a_seed));
                 snprintf(cur->job_id, JOBLEN, "%s", bs.job_id);
                 cur->diff = bs.diff; memcpy(cur->ptarget, bs.ptarget, 32); memcpy(cur->key, bs.key, 32);
                 cur->cert_version = bs.cert_version;
