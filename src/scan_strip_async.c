@@ -32,7 +32,7 @@ int scan_full(const int8_t *a_noised, int num_strips,
     // Prime only as many strips as the host API has independent buffer slots.
     int submitted = 0;
     while (submitted < num_strips && submitted < PEARL_PIPE_DEPTH) {
-        pearl_strip_submit_fast(a_noised + (size_t)submitted * R * K);
+        pearl_strip_submit_fast(a_noised ? a_noised + (size_t)submitted * R * K : 0);
         ++submitted;
     }
     for (int completed = 0; completed < num_strips; ++completed) {
@@ -49,7 +49,7 @@ int scan_full(const int8_t *a_noised, int num_strips,
             return 1;
         }
         if (submitted < num_strips) {
-            pearl_strip_submit_fast(a_noised + (size_t)submitted * R * K);
+            pearl_strip_submit_fast(a_noised ? a_noised + (size_t)submitted * R * K : 0);
             ++submitted;
         }
     }
