@@ -371,15 +371,22 @@ int main(int argc, char **argv) {
     bundle_t bun[2] = {0};
     for (int i = 0; i < 2; i++) {
         bun[i].slot = i;
-        bun[i].A = malloc((size_t)M * Kc); bun[i].B = malloc((size_t)N * Kc);
+        bun[i].A = malloc((size_t)M * Kc);
+        if (!g_reuse_b) bun[i].B = malloc((size_t)N * Kc);
         bun[i].An = pearl_pinned_alloc ? (int8_t *)pearl_pinned_alloc((size_t)M * Kc)
                                        : (int8_t *)malloc((size_t)M * Kc);
-        bun[i].Btn = pearl_pinned_alloc ? pearl_pinned_alloc((size_t)Kc * N)
-                                       : malloc((size_t)Kc * N);
-        bun[i].EAL = malloc((size_t)M * mp.rank); bun[i].EBR = malloc((size_t)N * mp.rank);
+        if (!g_reuse_b) {
+            bun[i].Btn = pearl_pinned_alloc ? pearl_pinned_alloc((size_t)Kc * N)
+                                           : malloc((size_t)Kc * N);
+            /* Only one prep worker runs at a time (joined before the next
+             * start). Neither scanning nor proof construction reads EAL/EBR. */
+            bun[i].EAL = i ? bun[0].EAL : malloc((size_t)M * mp.rank);
+            bun[i].EBR = i ? bun[0].EBR : malloc((size_t)N * mp.rank);
+        }
     }
     for (int i = 0; i < 2; ++i) {
-        if (!bun[i].A || !bun[i].B || !bun[i].An || !bun[i].Btn || !bun[i].EAL || !bun[i].EBR) {
+        if (!bun[i].A || !bun[i].An ||
+            (!g_reuse_b && (!bun[i].B || !bun[i].Btn || !bun[i].EAL || !bun[i].EBR))) {
             fputs("[!] bundle allocation failed\n", stderr); return 2;
         }
     }

@@ -176,6 +176,53 @@ static void perm_pairs(const uint8_t *seed, const uint8_t *key, int64_t lines, i
     }
 }
 
+/* AArch64 TBL gathers 16 noise values directly from register tables.
+ * Keep the uint16_t permutation representation for ranks > 256 and use the
+ * low byte only in this rank-128 specialization (all indices are < 128).
+ * Two disjoint 64-byte lookups return zero outside their respective ranges.
+ */
+#if defined(__aarch64__)
+typedef struct { int8x16x4_t lo, hi; } noise128_t;
+
+static inline noise128_t noise128_load(const int8_t *e) {
+    noise128_t t;
+    for (int i = 0; i < 4; ++i) {
+        t.lo.val[i] = vld1q_s8(e + i * 16);
+        t.hi.val[i] = vld1q_s8(e + 64 + i * 16);
+    }
+    return t;
+}
+
+static inline uint8x16_t indices16(const uint16_t *p) {
+    return vcombine_u8(vmovn_u16(vld1q_u16(p)),
+                       vmovn_u16(vld1q_u16(p + 8)));
+}
+
+static inline int8x16_t noise128_gather(noise128_t t, uint8x16_t idx) {
+    return vorrq_s8(vqtbl4q_s8(t.lo, idx),
+                    vqtbl4q_s8(t.hi, vsubq_u8(idx, vdupq_n_u8(64))));
+}
+
+static inline void noise128_apply(noise128_t t, const int8_t *src, int8_t *dst,
+                                  const uint16_t *f, const uint16_t *s,
+                                  int64_t count) {
+    int64_t j = 0;
+    for (; j + 16 <= count; j += 16) {
+        int8x16_t vf = noise128_gather(t, indices16(f + j));
+        int8x16_t vs = noise128_gather(t, indices16(s + j));
+        /* Non-saturating arithmetic preserves the original int8_t wrap. */
+        vst1q_s8(dst + j, vsubq_s8(vaddq_s8(vld1q_s8(src + j), vf), vs));
+    }
+    /* Callers use multiples of 16; retain a correct tail for other shapes. */
+    for (; j < count; ++j) {
+        uint8x16_t fi = vdupq_n_u8((uint8_t)f[j]);
+        uint8x16_t si = vdupq_n_u8((uint8_t)s[j]);
+        dst[j] = (int8_t)(src[j] + vgetq_lane_s8(noise128_gather(t, fi), 0)
+                                 - vgetq_lane_s8(noise128_gather(t, si), 0));
+    }
+}
+#endif
+
 static void compute_an(const int8_t *A, const int8_t *EAL, int8_t *out,
                        const uint16_t *f, const uint16_t *s,
                        int64_t m, int64_t k, int R, int nt) {
@@ -183,6 +230,12 @@ static void compute_an(const int8_t *A, const int8_t *EAL, int8_t *out,
     for (int64_t r = 0; r < m; r++) {
         const int8_t *ar = A + r * k, *el = EAL + r * R;
         int8_t *o = out + r * k;
+#if defined(__aarch64__)
+        if (R == 128) {
+            noise128_apply(noise128_load(el), ar, o, f, s, k);
+            continue;
+        }
+#endif
         int64_t j = 0;
 #ifdef HAVE_NEON
         int8_t efb[16], esb[16];
@@ -210,13 +263,27 @@ static void compute_bn(const int8_t *B, const int8_t *EBR, int8_t *out,
     int64_t kb = (k + TB - 1) / TB;
 #pragma omp parallel for schedule(static) num_threads(nt)
     for (int64_t ib = 0; ib < kb; ib++) {
-        int64_t i0 = ib * TB, i1 = i0 + TB > k ? k : i0 + TB;
+        int64_t i0 = ib * TB, ni = k - i0 < TB ? k - i0 : TB;
+        int8_t tile[TB][TB];
         for (int64_t j0 = 0; j0 < n; j0 += TB) {
-            int64_t j1 = j0 + TB > n ? n : j0 + TB;
-            for (int64_t j = j0; j < j1; j++) {
-                const int8_t *bj = B + j * k, *ej = EBR + j * R;
-                for (int64_t i = i0; i < i1; i++)
-                    out[i * n + j] = (int8_t)(bj[i] + ej[f[i]] - ej[s[i]]);
+            int64_t nj = n - j0 < TB ? n - j0 : TB;
+            for (int64_t j = 0; j < nj; ++j) {
+                const int8_t *bj = B + (j0 + j) * k + i0;
+                const int8_t *ej = EBR + (j0 + j) * R;
+#if defined(__aarch64__)
+                if (R == 128) {
+                    noise128_apply(noise128_load(ej), bj, tile[j], f + i0, s + i0, ni);
+                    continue;
+                }
+#endif
+                for (int64_t i = 0; i < ni; ++i)
+                    tile[j][i] = (int8_t)(bj[i] + ej[f[i0 + i]] - ej[s[i0 + i]]);
+            }
+            /* Transpose in a bounded per-thread tile; GM stores now follow
+             * adjacent columns instead of repeatedly writing n bytes apart. */
+            for (int64_t i = 0; i < ni; ++i) {
+                int8_t *dst = out + (i0 + i) * n + j0;
+                for (int64_t j = 0; j < nj; ++j) dst[j] = tile[j][i];
             }
         }
     }
@@ -231,13 +298,26 @@ static void compute_bn_pack(const int8_t *B, const int8_t *EBR, int8_t *bt,
     int64_t nbands = n / BN_PACK, NFOLD = k / R;
 #pragma omp parallel for schedule(static) num_threads(nt)
     for (int64_t jp = 0; jp < nbands; jp++) {
-        for (int64_t p = 0; p < NFOLD; p++) {
-            for (int64_t m = 0; m < BN_PACK; m++) {
-                int64_t col = jp * BN_PACK + m;
-                const int8_t *bcol = B + col * k;
-                const int8_t *ecol = EBR + col * R;
-                int8_t *dst = bt + ((jp * NFOLD + p) * BN_PACK + m) * R;
-                for (int64_t ki = 0; ki < R; ki++) {
+        /* One column at a time reuses its noise row across all folds and
+         * reads its source B column sequentially. The packed offset is unchanged. */
+        for (int64_t col_in_band = 0; col_in_band < BN_PACK; col_in_band++) {
+            int64_t col = jp * BN_PACK + col_in_band;
+            const int8_t *bcol = B + col * k;
+            const int8_t *ecol = EBR + col * R;
+#if defined(__aarch64__)
+            if (R == 128) {
+                noise128_t t = noise128_load(ecol);
+                for (int64_t p = 0; p < NFOLD; ++p) {
+                    int64_t row = p * R;
+                    int8_t *dst = bt + ((jp * NFOLD + p) * BN_PACK + col_in_band) * R;
+                    noise128_apply(t, bcol + row, dst, f + row, s + row, R);
+                }
+                continue;
+            }
+#endif
+            for (int64_t p = 0; p < NFOLD; ++p) {
+                int8_t *dst = bt + ((jp * NFOLD + p) * BN_PACK + col_in_band) * R;
+                for (int64_t ki = 0; ki < R; ++ki) {
                     int64_t row = p * R + ki;
                     dst[ki] = (int8_t)(bcol[row] + ecol[f[row]] - ecol[s[row]]);
                 }
@@ -277,8 +357,10 @@ static int prep_from_ab_impl(const int8_t *A, const int8_t *B, const uint8_t *ke
     unif_int8(seedA, commitA, m * R, EAL, nt);
     unif_int8(seedB, commitB, n * R, EBR, nt);
 
-    static uint16_t fA[1 << 16], sA[1 << 16], fB[1 << 16], sB[1 << 16];
     if (k > (1 << 16)) return -2;
+    uint16_t *pairs = malloc((size_t)k * 4 * sizeof(*pairs));
+    if (!pairs) return -3;
+    uint16_t *fA = pairs, *sA = fA + k, *fB = sA + k, *sB = fB + k;
     perm_pairs(seedA, commitA, k, R, fA, sA);
     perm_pairs(seedB, commitB, k, R, fB, sB);
 
@@ -288,6 +370,7 @@ static int prep_from_ab_impl(const int8_t *A, const int8_t *B, const uint8_t *ke
     } else {
         compute_bn(B, EBR, Bt_out, fB, sB, k, n, R, nt);
     }
+    free(pairs);
     return 0;
 }
 
@@ -354,10 +437,13 @@ int prep_b_side(uint64_t seed, int8_t *B, const uint8_t *key,
     static const uint8_t seedB[32] = "B_tensor";
     unif_int8(seedB, commitB, n * R, EBR, nt);
 
-    static uint16_t fB[1 << 16], sB[1 << 16];
+    uint16_t *fB = malloc((size_t)k * 2 * sizeof(*fB));
+    if (!fB) return -3;
+    uint16_t *sB = fB + k;
     perm_pairs(seedB, commitB, k, R, fB, sB);
 
     compute_bn_pack(B, EBR, bt_packed, fB, sB, k, n, R, nt);
+    free(fB);
     return 0;
 }
 
@@ -383,9 +469,12 @@ int prep_a_side(uint64_t seed, int8_t *A, const uint8_t *key, const uint8_t *com
     static const uint8_t seedA[32] = "A_tensor";
     unif_int8(seedA, commitA, m * R, EAL, nt);
 
-    static uint16_t fA[1 << 16], sA[1 << 16];
+    uint16_t *fA = malloc((size_t)k * 2 * sizeof(*fA));
+    if (!fA) return -3;
+    uint16_t *sA = fA + k;
     perm_pairs(seedA, commitA, k, R, fA, sA);
 
     compute_an(A, EAL, A_noised, fA, sA, m, k, R, nt);
+    free(fA);
     return 0;
 }
