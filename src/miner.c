@@ -3,6 +3,7 @@
  */
 #include "pools/pool.h"
 #include "prep_state.h"
+#include "pearl_pipeline.h"
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -17,6 +18,7 @@
 #define R 128
 
 extern int pearl_init(int dev, int nbands);
+extern int pearl_validate_shape(int64_t m, int64_t n, int64_t k, int64_t rank);
 extern void pearl_set_b(const int8_t *b, int n);
 extern void pearl_set_b_slot(const int8_t *b, int n, int slot) __attribute__((weak));
 extern void pearl_use_b(int slot) __attribute__((weak));
@@ -207,10 +209,55 @@ static void *prep_worker(void *p) {
     return 0;
 }
 
-static void start_prep(pthread_t *thread, bundle_t *b) {
-    if (pthread_create(thread, 0, prep_worker, b)) {
-        fputs("[!] cannot start prep worker\n", stderr); exit(2);
+/* Keep one prep thread (and its OpenMP team cache) alive across scans. Only
+ * one prep request is outstanding; bundle ownership still follows proof_cv. */
+static pthread_mutex_t prep_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t prep_cv = PTHREAD_COND_INITIALIZER;
+static bundle_t *prep_request;
+static int prep_running, prep_started, prep_stop;
+static void *prep_dispatch(void *unused) {
+    (void)unused;
+    pthread_mutex_lock(&prep_mu);
+    for (;;) {
+        while (!prep_request && !prep_stop) pthread_cond_wait(&prep_cv, &prep_mu);
+        if (prep_stop) break;
+        bundle_t *b = prep_request;
+        prep_request = 0;
+        pthread_mutex_unlock(&prep_mu);
+        prep_worker(b);
+        pthread_mutex_lock(&prep_mu);
+        prep_running = 0;
+        pthread_cond_broadcast(&prep_cv);
     }
+    pthread_mutex_unlock(&prep_mu);
+    return 0;
+}
+static void start_prep(pthread_t *thread, bundle_t *b) {
+    pthread_mutex_lock(&prep_mu);
+    if (!prep_started) {
+        if (pthread_create(thread, 0, prep_dispatch, 0)) {
+            fputs("[!] cannot start prep worker\n", stderr); exit(2);
+        }
+        prep_started = 1;
+    }
+    while (prep_running) pthread_cond_wait(&prep_cv, &prep_mu);
+    prep_running = 1;
+    prep_request = b;
+    pthread_cond_broadcast(&prep_cv);
+    pthread_mutex_unlock(&prep_mu);
+}
+static void wait_prep(void) {
+    pthread_mutex_lock(&prep_mu);
+    while (prep_running) pthread_cond_wait(&prep_cv, &prep_mu);
+    pthread_mutex_unlock(&prep_mu);
+}
+static void stop_prep(pthread_t thread) {
+    wait_prep();
+    pthread_mutex_lock(&prep_mu);
+    prep_stop = 1;
+    pthread_cond_broadcast(&prep_cv);
+    pthread_mutex_unlock(&prep_mu);
+    pthread_join(thread, 0);
 }
 
 static void bundle_key(bundle_t *b) {
@@ -368,7 +415,10 @@ int main(int argc, char **argv) {
     while (do_handshake(host, port, addr, worker, pass)) { puts("[!] handshake failed, retry 10s"); sleep(10); }
 
     long M = mp.m, N = mp.n, Kc = mp.k;
+    if (pearl_validate_shape(M, N, Kc, mp.rank)) return 2;
     int nbands = (int)(N / 64), nstrips = (int)(M / R);
+    const size_t packed_n = ((size_t)N + 64 * PEARL_BAND_GROUP - 1) /
+                            (64 * PEARL_BAND_GROUP) * (64 * PEARL_BAND_GROUP);
     int tile_h = (int)mp.nrows, n_hi = R / tile_h;
     if (pearl_init(dev, nbands)) { puts("pearl_init failed"); return 2; }
 
@@ -381,8 +431,8 @@ int main(int argc, char **argv) {
         bun[i].An = pearl_pinned_alloc ? (int8_t *)pearl_pinned_alloc((size_t)M * Kc)
                                        : (int8_t *)malloc((size_t)M * Kc);
         if (!g_reuse_b) {
-            bun[i].Btn = pearl_pinned_alloc ? pearl_pinned_alloc((size_t)Kc * N)
-                                           : malloc((size_t)Kc * N);
+            bun[i].Btn = pearl_pinned_alloc ? pearl_pinned_alloc((size_t)Kc * packed_n)
+                                           : malloc((size_t)Kc * packed_n);
             bun[i].EAL = malloc((size_t)M * mp.rank);
             bun[i].EBR = malloc((size_t)N * mp.rank);
         }
@@ -401,7 +451,7 @@ int main(int argc, char **argv) {
     }
 
     if (g_reuse_b) {
-        bs.B = malloc((size_t)N * Kc); bs.bt = pearl_pinned_alloc ? pearl_pinned_alloc((size_t)Kc * N) : malloc((size_t)Kc * N);
+        bs.B = malloc((size_t)N * Kc); bs.bt = pearl_pinned_alloc ? pearl_pinned_alloc((size_t)Kc * packed_n) : malloc((size_t)Kc * packed_n);
         bs.EBR = malloc((size_t)N * mp.rank); bs.valid = 0;
         g_EAL = malloc((size_t)M * mp.rank);
         if (!bs.B || !bs.bt || !bs.EBR || !g_EAL) {
@@ -425,7 +475,7 @@ int main(int argc, char **argv) {
         // Two bundles let CPU preparation and B transfer overlap NPU scanning.
         bundle_t *cur = &bun[iter % 2], *nxt = &bun[(iter + 1) % 2];
         struct timespec lj0; clock_gettime(CLOCK_MONOTONIC, &lj0);
-        pthread_join(pt, 0);
+        wait_prep();
         struct timespec lj1; clock_gettime(CLOCK_MONOTONIC, &lj1);
         coexist_gate();
         if (g_reuse_b) {
@@ -476,7 +526,7 @@ int main(int argc, char **argv) {
             }
         }
     }
-    pthread_join(pt, 0);
+    stop_prep(pt);
     proof_drain();
     pthread_mutex_lock(&proof_mu); proof_stop = 1;
     pthread_cond_broadcast(&proof_cv); pthread_mutex_unlock(&proof_mu);

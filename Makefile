@@ -26,6 +26,7 @@ endif
 MDIM ?= 16384
 # Host strip slots (separate from kernel BUFS). Use 2 for an A/B baseline.
 PIPE_DEPTH ?= 4
+BAND_GROUP ?= 2
 
 OUT  := build
 # Locate BLAKE3 C sources from the Cargo registry when building the standalone miner.
@@ -33,7 +34,7 @@ BLK  ?= $(shell ls -d /root/.cargo/registry/src/*/blake3-1*/c 2>/dev/null | head
 BLK_SRC := $(BLK)/blake3.c $(BLK)/blake3_dispatch.c $(BLK)/blake3_portable.c $(BLK)/blake3_neon.c
 CC   := gcc
 # BLAKE3_USE_TBB uses the pthread split hook in blake3_join.c (not oneTBB).
-CFLAGS := -std=gnu11 -O3 -fopenmp -march=armv8-a+crypto -DBLAKE3_USE_NEON=1 -DBLAKE3_USE_TBB -DK=$(K) -DRANK=$(RANK) -DMDIM=$(MDIM) -DPEARL_PIPE_DEPTH=$(PIPE_DEPTH) -I$(BLK)
+CFLAGS := -std=gnu11 -O3 -fopenmp -march=armv8-a+crypto -DBLAKE3_USE_NEON=1 -DBLAKE3_USE_TBB -DK=$(K) -DRANK=$(RANK) -DMDIM=$(MDIM) -DPEARL_BAND_GROUP=$(BAND_GROUP) -DPEARL_PIPE_DEPTH=$(PIPE_DEPTH) -I$(BLK)
 RPATH  := -Wl,-rpath,'$$ORIGIN'
 
 .PHONY: all miner kernel proof guard clean
@@ -59,7 +60,7 @@ guard: $(OUT)
 kernel: $(OUT)
 	cd kernel && rm -rf build && mkdir build && cd build && \
 	  cmake -DCMAKE_ASC_RUN_MODE=npu -DCMAKE_ASC_ARCHITECTURES=dav-2201 \
-	        -DPEARL_PIPE_DEPTH=$(PIPE_DEPTH) -DNINNER=$(NINNER) -DNFOLD=$(NFOLD) -DBUFS=4 -DVEC2X=2 \
+	        -DPEARL_BAND_GROUP=$(BAND_GROUP) -DPEARL_PIPE_DEPTH=$(PIPE_DEPTH) -DNINNER=$(NINNER) -DNFOLD=$(NFOLD) -DBUFS=4 -DVEC2X=2 \
 	        -DCMAKE_MODULE_PATH="$$ASC_MODULES" .. && make -j
 	cp kernel/build/libpearl_hlc2.so $(OUT)/
 

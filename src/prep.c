@@ -4,6 +4,7 @@
 #include <omp.h>
 #include "blake3.h"
 #include "prep_state.h"
+#include "pearl_pipeline.h"
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
@@ -186,6 +187,26 @@ static void perm_pairs(const uint8_t *seed, const uint8_t *key, int64_t lines, i
     }
 }
 
+#ifdef HAVE_NEON
+/* Rank-128 gather uses two 64-byte NEON tables. Out-of-range TBL lanes
+ * are zero, so OR joins the two disjoint index ranges exactly. */
+typedef struct { uint8x16x4_t lo, hi; } rank128_table;
+static inline rank128_table load_rank128(const int8_t *row) {
+    rank128_table t;
+    for (int i = 0; i < 4; ++i) {
+        t.lo.val[i] = vld1q_u8((const uint8_t *)row + i * 16);
+        t.hi.val[i] = vld1q_u8((const uint8_t *)row + 64 + i * 16);
+    }
+    return t;
+}
+static inline int8x16_t gather_rank128(rank128_table t, const uint16_t *idx) {
+    uint8x16_t ix = vcombine_u8(vmovn_u16(vld1q_u16(idx)),
+                               vmovn_u16(vld1q_u16(idx + 8)));
+    return vreinterpretq_s8_u8(vorrq_u8(vqtbl4q_u8(t.lo, ix),
+        vqtbl4q_u8(t.hi, vsubq_u8(ix, vdupq_n_u8(64)))));
+}
+#endif
+
 static void compute_an(const int8_t *A, const int8_t *EAL, int8_t *out,
                        const uint16_t *f, const uint16_t *s,
                        int64_t m, int64_t k, int R, int nt) {
@@ -195,6 +216,14 @@ static void compute_an(const int8_t *A, const int8_t *EAL, int8_t *out,
         int8_t *o = out + r * k;
         int64_t j = 0;
 #ifdef HAVE_NEON
+        if (R == 128) {
+            rank128_table table = load_rank128(el);
+            for (; j + 16 <= k; j += 16) {
+                int8x16_t vf = gather_rank128(table, f + j);
+                int8x16_t vs = gather_rank128(table, s + j);
+                vst1q_s8(o + j, vsubq_s8(vaddq_s8(vld1q_s8(ar + j), vf), vs));
+            }
+        }
         int8_t efb[16], esb[16];
         for (; j + 16 <= k; j += 16) {
             for (int t = 0; t < 16; t++) {
@@ -233,21 +262,42 @@ static void compute_bn(const int8_t *B, const int8_t *EBR, int8_t *out,
 }
 
 #define BN_PACK 64
-// Pack the noised B matrix by 64-column band and rank-sized fold, matching the
-// NPU cube kernel's [band][fold][column][k] access order.
+// Pack noised B as [group][fold][group-column][k]. Adjacent 64-column
+// bands share one Matmul; the last group is zero-padded without extra hashes.
 static void compute_bn_pack(const int8_t *B, const int8_t *EBR, int8_t *bt,
                             const uint16_t *f, const uint16_t *s,
                             int64_t k, int64_t n, int R, int nt) {
-    int64_t nbands = n / BN_PACK, NFOLD = k / R;
+    const int64_t group_cols = BN_PACK * PEARL_BAND_GROUP;
+    int64_t nbands = (n + group_cols - 1) / group_cols, NFOLD = k / R;
 #pragma omp parallel for schedule(static) num_threads(nt)
     for (int64_t jp = 0; jp < nbands; jp++) {
-        for (int64_t p = 0; p < NFOLD; p++) {
-            for (int64_t m = 0; m < BN_PACK; m++) {
-                int64_t col = jp * BN_PACK + m;
-                const int8_t *bcol = B + col * k;
-                const int8_t *ecol = EBR + col * R;
-                int8_t *dst = bt + ((jp * NFOLD + p) * BN_PACK + m) * R;
-                for (int64_t ki = 0; ki < R; ki++) {
+        for (int64_t m = 0; m < group_cols; m++) {
+            int64_t col = jp * group_cols + m;
+            if (col >= n) {
+                for (int64_t p = 0; p < NFOLD; ++p)
+                    memset(bt + ((jp * NFOLD + p) * group_cols + m) * R, 0, (size_t)R);
+                continue;
+            }
+            const int8_t *bcol = B + col * k;
+            const int8_t *ecol = EBR + col * R;
+#ifdef HAVE_NEON
+            rank128_table table;
+            if (R == 128) table = load_rank128(ecol);
+#endif
+            for (int64_t p = 0; p < NFOLD; p++) {
+                int8_t *dst = bt + ((jp * NFOLD + p) * group_cols + m) * R;
+                int64_t ki = 0;
+#ifdef HAVE_NEON
+                if (R == 128) {
+                    for (; ki + 16 <= R; ki += 16) {
+                        int64_t row = p * R + ki;
+                        int8x16_t vf = gather_rank128(table, f + row);
+                        int8x16_t vs = gather_rank128(table, s + row);
+                        vst1q_s8(dst + ki, vsubq_s8(vaddq_s8(vld1q_s8(bcol + row), vf), vs));
+                    }
+                }
+#endif
+                for (; ki < R; ki++) {
                     int64_t row = p * R + ki;
                     dst[ki] = (int8_t)(bcol[row] + ecol[f[row]] - ecol[s[row]]);
                 }

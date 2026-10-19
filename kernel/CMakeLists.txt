@@ -3,6 +3,7 @@ set(CMAKE_ASC_ARCHITECTURES "dav-2201" CACHE STRING "NPU architecture")
 find_package(ASC REQUIRED)
 project(pearl_hlc2 LANGUAGES ASC CXX)
 # Tuned config: NINNER=1 NFOLD=32 BUFS=4 VEC2X=2
+set(PEARL_BAND_GROUP "2" CACHE STRING "adjacent bands per Matmul")
 set(NINNER "1"  CACHE STRING "inner matmuls per fold-step")
 set(NFOLD  "32" CACHE STRING "fold-steps")
 set(PEARL_PIPE_DEPTH "4" CACHE STRING "host strip queue depth")
@@ -14,6 +15,7 @@ set_target_properties(pearl_hlc2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(pearl_hlc2 PRIVATE tiling_api register platform m dl pthread)
 target_compile_options(pearl_hlc2 PRIVATE
     $<$<COMPILE_LANGUAGE:ASC>:--npu-arch=${CMAKE_ASC_ARCHITECTURES}>
+    $<$<COMPILE_LANGUAGE:ASC>:-DPEARL_BAND_GROUP=${PEARL_BAND_GROUP}>
     $<$<COMPILE_LANGUAGE:ASC>:-DNINNER=${NINNER}>
     $<$<COMPILE_LANGUAGE:ASC>:-DNFOLD=${NFOLD}>
     $<$<COMPILE_LANGUAGE:ASC>:-DPEARL_PIPE_DEPTH=${PEARL_PIPE_DEPTH}>
