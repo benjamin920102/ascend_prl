@@ -31,9 +31,9 @@ jobs:
 
       - name: Download and Install Ascend CANN Toolkit
         run: |
-          wget -q https://ascend.devcloud.huaweicloud.com/artifactory/cann-run-mirror/software/legacy/20260422000325096/Ascend-cann-toolkit_9.0.0_linux-aarch64.run
-          chmod +x Ascend-cann-toolkit_9.0.0_linux-aarch64.run
-          bash ./Ascend-cann-toolkit_9.0.0_linux-aarch64.run --install --quiet
+          wget -q https://ascend.devcloud.huaweicloud.com/artifactory/cann-run-mirror/software/legacy/20261015201912253/Ascend-cann-toolkit_9.2.0_linux-aarch64.run
+          chmod +x Ascend-cann-toolkit_9.2.0_linux-aarch64.run
+          bash ./Ascend-cann-toolkit_9.2.0_linux-aarch64.run --install --quiet
           sudo su -c "
             rustup default stable
           "
