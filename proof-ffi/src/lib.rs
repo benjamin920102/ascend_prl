@@ -56,11 +56,11 @@ pub unsafe extern "C" fn hash_key(
     0
 }
 
-/// Serialize a PlainProof as base64(bincode), returning its length or -1 if
+/// Serialize a PlainProof as raw bincode, returning its length or -1 if
 /// the output capacity is insufficient. All pointers must refer to valid
 /// buffers of the indicated sizes; `out` must be writable for `cap` bytes.
 #[no_mangle]
-pub unsafe extern "C" fn build_proof_b64(
+pub unsafe extern "C" fn build_proof_bin(
     a: *const u8,
     b: *const u8,
     m: usize,
@@ -94,11 +94,10 @@ pub unsafe extern "C" fn build_proof_b64(
         bt: matrix_proof(b, key32, b_cols, k),
         moe: None,
     };
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    let b64 = STANDARD.encode(bincode::serialize(&proof).unwrap());
-    if b64.len() > cap {
+    let bin = bincode::serialize(&proof).unwrap();
+    if bin.len() > cap {
         return -1;
     }
-    std::ptr::copy_nonoverlapping(b64.as_ptr(), out, b64.len());
-    b64.len() as isize
+    std::ptr::copy_nonoverlapping(bin.as_ptr(), out, bin.len());
+    bin.len() as isize
 }

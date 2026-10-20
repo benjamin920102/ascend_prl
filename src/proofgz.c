@@ -65,50 +65,14 @@ static ssize_t b64_encode(const uint8_t *in, size_t n, char *out, size_t cap) {
     return (ssize_t)o;
 }
 
-static int b64_val(int c) {
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '+') return 62;
-    if (c == '/') return 63;
-    return -1;
-}
-
-// Ignore non-alphabet characters; an incomplete final quartet yields 1 or 2 bytes.
-static ssize_t b64_decode(const char *in, size_t n, uint8_t *out, size_t cap) {
-    int q[4], qi = 0; size_t o = 0;
-    for (size_t i = 0; i < n; i++) {
-        if (in[i] == '=') break;
-        int v = b64_val((unsigned char)in[i]);
-        if (v < 0) continue;
-        q[qi++] = v;
-        if (qi == 4) {
-            if (o + 3 > cap) return -1;
-            out[o++] = (uint8_t)((q[0] << 2) | (q[1] >> 4));
-            out[o++] = (uint8_t)(((q[1] & 15) << 4) | (q[2] >> 2));
-            out[o++] = (uint8_t)(((q[2] & 3) << 6) | q[3]);
-            qi = 0;
-        }
-    }
-    if (qi >= 2) {
-        if (o + (size_t)(qi - 1) > cap) return -1;
-        out[o++] = (uint8_t)((q[0] << 2) | (q[1] >> 4));
-        if (qi >= 3) out[o++] = (uint8_t)(((q[1] & 15) << 4) | (q[2] >> 2));
-    }
-    return (ssize_t)o;
-}
-
-ssize_t gzip_proof_b64(const char *in_b64, size_t in_len, uint8_t *out, size_t cap) {
-    size_t bin_cap = (in_len / 4) * 3 + 4;
-    uint8_t *bin = malloc(bin_cap);
-    if (!bin) return -1;
-    ssize_t bn = b64_decode(in_b64, in_len, bin, bin_cap);
-    if (bn < 0) { free(bin); return -1; }
-    size_t gz_cap = (size_t)bn + (size_t)bn / 2 + 256;
+/* Encode once at the wire boundary. Gzip consumes the raw bincode bytes. */
+ssize_t encode_proof_b64(const uint8_t *bin, size_t bin_len, int gzip,
+                         uint8_t *out, size_t cap) {
+    if (!gzip) return b64_encode(bin, bin_len, (char *)out, cap);
+    size_t gz_cap = bin_len + bin_len / 2 + 256;
     uint8_t *gz = malloc(gz_cap);
-    if (!gz) { free(bin); return -1; }
-    ssize_t gn = gz_compress(bin, (size_t)bn, gz, gz_cap);
-    free(bin);
+    if (!gz) return -1;
+    ssize_t gn = gz_compress(bin, bin_len, gz, gz_cap);
     if (gn < 0) { free(gz); return -1; }
     ssize_t on = b64_encode(gz, (size_t)gn, (char *)out, cap);
     free(gz);

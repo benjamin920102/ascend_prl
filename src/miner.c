@@ -37,13 +37,14 @@ extern int prep_a_side(uint64_t seed, int8_t *A, const uint8_t *key, const uint8
 extern int scan_full(const int8_t *an, int nstrips, const uint8_t *key, const uint32_t *tgt,
                      int nbands, int n_hi, int pow_threads, uint32_t *scratch,
                      int *hs, int *ht);
-extern ssize_t build_proof_b64(const uint8_t *a, const uint8_t *b, size_t m, size_t n,
+extern ssize_t build_proof_bin(const uint8_t *a, const uint8_t *b, size_t m, size_t n,
                                size_t k, size_t rank, const uint8_t *key,
                                const size_t *ar, size_t na, const size_t *bc, size_t nb,
                                uint8_t *out, size_t cap);
 extern int hash_key(const uint8_t *hdr, size_t hl, size_t k, size_t rank,
                     const size_t *rp, size_t nr, const size_t *cp, size_t nc, uint8_t *out);
-extern ssize_t gzip_proof_b64(const char *in_b64, size_t in_len, uint8_t *out, size_t cap);
+extern ssize_t encode_proof_b64(const uint8_t *bin, size_t bin_len, int gzip,
+                                uint8_t *out, size_t cap);
 
 static pool_conn_t user_conn;
 static job_t *g_job = &user_conn.job;
@@ -244,7 +245,7 @@ static void coexist_gate(void) {
     puts("[coexist] resume");
 }
 
-static void process_proof(bundle_t *cur, uint8_t *b64, uint8_t *gzbuf) {
+static void process_proof(bundle_t *cur, uint8_t *bin, uint8_t *payload_buf) {
     long M = mp.m, N = mp.n, Kc = mp.k;
     int nbands = (int)(N / 64), ht_per_block = 64 / (int)mp.nrows;
     size_t rows_abs[64], cols_abs[64];
@@ -255,22 +256,25 @@ static void process_proof(bundle_t *cur, uint8_t *b64, uint8_t *gzbuf) {
     for (size_t i = 0; i < mp.nrows; i++) rows_abs[i] = (size_t)row + mp.rows[i];
     for (size_t i = 0; i < mp.ncols; i++) cols_abs[i] = (size_t)col + mp.cols[i];
     double proof_start = monotonic_ms();
-    ssize_t bl = build_proof_b64((uint8_t *)cur->A, (uint8_t *)(g_reuse_b ? bs.B : cur->B),
+    ssize_t bl = build_proof_bin((uint8_t *)cur->A, (uint8_t *)(g_reuse_b ? bs.B : cur->B),
                                  (size_t)M, (size_t)N, (size_t)Kc, (size_t)mp.rank,
                                  cur->key, rows_abs, mp.nrows, cols_abs, mp.ncols,
-                                 b64, 64 << 20);
+                                 bin, 64 << 20);
     double proof_end = monotonic_ms();
     if (bl > 0) {
         pool_conn_t *sc = &user_conn;
         const char *sub_addr = submit_addr;
-        const uint8_t *payload = b64; size_t plen = (size_t)bl;
         pool_conn_t prefix_conn = {0};
+        // Use the same negotiated format for encoding and the submit prefix.
         prefix_conn.gzip = sc->gzip;
-        if (prefix_conn.gzip) {
-            ssize_t gl = gzip_proof_b64((const char *)b64, (size_t)bl, gzbuf, 64 << 20);
-            if (gl > 0) { payload = gzbuf; plen = (size_t)gl; }
-            else { printf("[!] gzip proof failed (%zd), dropping share\n", gl); plen = 0; }
+        ssize_t encoded_len = encode_proof_b64(bin, (size_t)bl, prefix_conn.gzip,
+                                               payload_buf, 64 << 20);
+        if (encoded_len <= 0) {
+            printf("[!] proof encoding failed (%zd), dropping share\n", encoded_len);
+            return;
         }
+        const uint8_t *payload = payload_buf;
+        size_t plen = (size_t)encoded_len;
         double gzip_end = monotonic_ms();
         // Snapshot gzip negotiation for both payload and prefix. The reader
         // may negotiate it while proof construction is running.
@@ -314,8 +318,8 @@ static void process_proof(bundle_t *cur, uint8_t *b64, uint8_t *gzbuf) {
 
 static void *proof_worker(void *unused) {
     (void)unused;
-    uint8_t *b64 = malloc(64 << 20), *gzbuf = malloc(64 << 20);
-    if (!b64 || !gzbuf) { fputs("[!] proof buffer allocation failed\n", stderr); exit(2); }
+    uint8_t *bin = malloc(64 << 20), *payload_buf = malloc(64 << 20);
+    if (!bin || !payload_buf) { fputs("[!] proof buffer allocation failed\n", stderr); exit(2); }
     for (;;) {
         pthread_mutex_lock(&proof_mu);
         while (!proof_count && !proof_stop) pthread_cond_wait(&proof_cv, &proof_mu);
@@ -325,7 +329,7 @@ static void *proof_worker(void *unused) {
         pthread_cond_broadcast(&proof_cv);
         pthread_mutex_unlock(&proof_mu);
         struct timespec a, z; clock_gettime(CLOCK_MONOTONIC, &a);
-        process_proof(b, b64, gzbuf);
+        process_proof(b, bin, payload_buf);
         clock_gettime(CLOCK_MONOTONIC, &z);
         if (getenv("PRL_LOOP_PROF")) fprintf(stderr, "[proofprof] proof+gzip+send=%.1fms\n",
             (z.tv_sec-a.tv_sec)*1e3 + (z.tv_nsec-a.tv_nsec)/1e6);
@@ -334,7 +338,7 @@ static void *proof_worker(void *unused) {
         pthread_cond_broadcast(&proof_cv);
         pthread_mutex_unlock(&proof_mu);
     }
-    free(b64); free(gzbuf); return 0;
+    free(bin); free(payload_buf); return 0;
 }
 
 int main(int argc, char **argv) {
