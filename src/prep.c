@@ -231,11 +231,8 @@ static void compute_an(const int8_t *A, const int8_t *EAL, int8_t *out,
         const int8_t *ar = A + r * k, *el = EAL + r * R;
         int8_t *o = out + r * k;
 #if defined(__aarch64__)
-        if (R == 128) {
-            noise128_apply(noise128_load(el), ar, o, f, s, k);
-            continue;
-        }
-#endif
+        noise128_apply(noise128_load(el), ar, o, f, s, k);
+#else
         int64_t j = 0;
 #ifdef HAVE_NEON
         int8_t efb[16], esb[16];
@@ -253,6 +250,7 @@ static void compute_an(const int8_t *A, const int8_t *EAL, int8_t *out,
 #endif
         for (; j < k; j++)
             o[j] = (int8_t)(ar[j] + el[f[j]] - el[s[j]]);
+#endif
     }
 }
 
@@ -271,13 +269,11 @@ static void compute_bn(const int8_t *B, const int8_t *EBR, int8_t *out,
                 const int8_t *bj = B + (j0 + j) * k + i0;
                 const int8_t *ej = EBR + (j0 + j) * R;
 #if defined(__aarch64__)
-                if (R == 128) {
-                    noise128_apply(noise128_load(ej), bj, tile[j], f + i0, s + i0, ni);
-                    continue;
-                }
-#endif
+                noise128_apply(noise128_load(ej), bj, tile[j], f + i0, s + i0, ni);
+#else
                 for (int64_t i = 0; i < ni; ++i)
                     tile[j][i] = (int8_t)(bj[i] + ej[f[i0 + i]] - ej[s[i0 + i]]);
+#endif
             }
             /* Transpose in a bounded per-thread tile; GM stores now follow
              * adjacent columns instead of repeatedly writing n bytes apart. */
@@ -305,16 +301,13 @@ static void compute_bn_pack(const int8_t *B, const int8_t *EBR, int8_t *bt,
             const int8_t *bcol = B + col * k;
             const int8_t *ecol = EBR + col * R;
 #if defined(__aarch64__)
-            if (R == 128) {
-                noise128_t t = noise128_load(ecol);
-                for (int64_t p = 0; p < NFOLD; ++p) {
-                    int64_t row = p * R;
-                    int8_t *dst = bt + ((jp * NFOLD + p) * BN_PACK + col_in_band) * R;
-                    noise128_apply(t, bcol + row, dst, f + row, s + row, R);
-                }
-                continue;
+            noise128_t t = noise128_load(ecol);
+            for (int64_t p = 0; p < NFOLD; ++p) {
+                int64_t row = p * R;
+                int8_t *dst = bt + ((jp * NFOLD + p) * BN_PACK + col_in_band) * R;
+                noise128_apply(t, bcol + row, dst, f + row, s + row, R);
             }
-#endif
+#else
             for (int64_t p = 0; p < NFOLD; ++p) {
                 int8_t *dst = bt + ((jp * NFOLD + p) * BN_PACK + col_in_band) * R;
                 for (int64_t ki = 0; ki < R; ++ki) {
@@ -322,6 +315,7 @@ static void compute_bn_pack(const int8_t *B, const int8_t *EBR, int8_t *bt,
                     dst[ki] = (int8_t)(bcol[row] + ecol[f[row]] - ecol[s[row]]);
                 }
             }
+#endif
         }
     }
 }
