@@ -43,7 +43,7 @@ $(OUT):
 	mkdir -p $(OUT)
 
 # Link exactly one frontend per binary; build-time rank/shape is encoded in the proof.
-ENGINE_SRC := src/miner.c src/proofgz.c src/pools/stratum.c src/prep.c src/scan_strip_async.c src/blake3_join.c $(BLK_SRC)
+ENGINE_SRC := src/miner.c src/proofgz.c src/pools/stratum.c src/prep.c src/scan_strip_async.c src/blake3_join.c src/cpu_budget.c $(BLK_SRC)
 # Use libz's soname: some runtime images lack the libz.so development symlink.
 LINK := -L$(OUT) -lpearl_hlc2 -lpearl_proof -lpthread -l:libz.so.1 $(RPATH)
 miner: $(OUT)

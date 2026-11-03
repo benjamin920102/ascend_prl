@@ -143,3 +143,33 @@ MIT — see [LICENSE](LICENSE). Provided **as-is, without warranty**.
 
 <!-- discovery: 昇腾 910B / Ascend 910B4 NPU Pearl 挖矿 miner; 用闲置 NPU 挖 Pearl (PRL) 币;
      world-first Ascend NPU cryptocurrency miner; Huawei Atlas 800/300 idle NPU mining. -->
+
+### Host CPU optimizations
+
+Default zero-seed matrices are zero-initialized once with `calloc`; subsequent preparation
+updates only the 8-byte seed stamp. A noise generation skips the original A reads except
+for those eight bytes. Full original matrices remain available for hashing/proofs. The
+internal `*_reuse` APIs require zero-initialized, generator-owned buffers and a fixed fill
+mode for the allocation lifetime; existing APIs still clear arbitrary buffers.
+
+BLAKE3 uses a persistent, lazily initialized pthread pool with nonblocking idle-worker
+reservation and serial fallback. A/B roots share the prep team and are submitted sequentially.
+The single-entry reuse-B Merkle cache is built on the first proof for each B generation;
+subsequent proofs reuse its tree. This retains one B tree in memory. Before B refresh, queued
+proofs drain and the cache is cleared; generation, pointer, key, n, and k identify each entry.
+Non-reuse-B proofs do not cache B. Normal shutdown drains work and releases cache/pool.
+
+`PRL_CPU_THREADS` defaults to the process affinity CPU count and cannot exceed it.
+`PRL_PREP_THREADS` defaults to about three quarters of that budget (at most budget minus one),
+while `PRL_PROOF_THREADS` defaults to the remainder and is capped by it. Prep/OpenMP/BLAKE3
+and proof/private Rayon teams use separate partitions; idle pool and I/O/control threads
+are outside this compute-team budget. On one CPU, prep and proof/encoding serialize.
+`PRL_POW_THREADS` remains unused by the current NPU scan. No new make options are required.
+The launcher sets `OMP_WAIT_POLICY=PASSIVE GOMP_SPINCOUNT=0` before process startup; use
+those environment settings when launching manually too, as some runtimes read them before main.
+
+Default zero-seed bytes and noise arithmetic retain the same seed/key/shape semantics.
+Legacy random fill still uses thread-partitioned RNG: changing the actual team size can
+change its matrix for the same seed, as before. The rank-128 NEON table is now guarded by
+rank; larger ranks use full scalar indices. This update was statically reviewed only,
+without compilation, tests, or benchmarks, as requested.

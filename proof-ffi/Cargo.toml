@@ -14,3 +14,4 @@ pearl-blake3 = { path = "/root/pearl-rust/pearl-blake3", features = ["serde"] }
 zk-pow = { path = "/root/pearl-rust/zk-pow" }
 bincode = "1"
 blake3 = "1.8"
+rayon = "1"

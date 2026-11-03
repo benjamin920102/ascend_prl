@@ -100,6 +100,8 @@ for d in "${DEVS[@]}"; do
   ncore=$( [ -n "$cpus" ] && node_cores "$cpus" || nproc )
   prep=$(( ncore*3/4 )); pow=$(( ncore/4 )); [ $prep -lt 1 ] && prep=1; [ $pow -lt 1 ] && pow=1
   pin=(); [ -n "$cpus" ] && pin=(taskset -c "$cpus")
+  OMP_WAIT_POLICY=PASSIVE GOMP_SPINCOUNT=0 \
+  PRL_CPU_THREADS=${PRL_CPU_THREADS:-$ncore} \
   PRL_REUSE_B=1 PRL_PREP_THREADS=$prep PRL_POW_THREADS=$pow \
     setsid "${pin[@]}" "$BIN" "$d" "$WORKER-$d" "$POOL" "$PORT" "$WALLET" "$PASS" \
     > "prl-dev$d.log" 2>&1 < /dev/null &

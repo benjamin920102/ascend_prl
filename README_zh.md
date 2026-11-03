@@ -146,3 +146,35 @@ MIT —— 见 [LICENSE](LICENSE)。按**「现状」提供，不作任何担保
 
 <!-- discovery: 昇腾 910B / Ascend 910B4 NPU Pearl 挖矿 miner; 用闲置 NPU 挖 Pearl (PRL) 币;
      world-first Ascend NPU cryptocurrency miner; Huawei Atlas 800/300 idle NPU mining. -->
+
+### Host CPU 优化
+
+- 默认 zero-seed：原始 A/B 改用 `calloc` 初始化，此后每轮只覆盖前 8 bytes seed；
+  A noise 直接从零基底生成，最后以 int8 wrap 补回 seed stamp。原始矩阵仍完整保留给
+  Merkle hash 和 proof，因此这里只消除 noise 阶段的 A 全量读取，不消除 Merkle 读取。
+  `PRL_ZERO_SEED=0` 仍执行完整随机填充。内部 `*_reuse` API 要求 buffer 首次清零、
+  后续只由生成器写入，且 buffer 生命周期内不切换填充模式；旧 API 仍清零任意输入 buffer。
+- BLAKE3：首次大 hash 懒初始化持久 pthread pool，之后复用；无空闲 worker 时在调用线程
+  计算，不阻塞等待可用 worker。prep 的 A/B root 顺序提交，同一个 hash 可使用整个 prep
+  额度。OpenMP 与 BLAKE3 是先后执行的阶段。正常退出时先排空 prep/proof，再关闭 pool。
+- reuse-B：每代 B 的首次 proof 懒建立 B Merkle tree，之后只提取需要的 multileaf proof。
+  cache 只保留一棵 B tree，会增加常驻内存；A tree 仍逐次建立。job / PRL_BREUSE 更新 B
+  前先排空 proof、清除 cache、递增 generation，退出时也清除。cache 同时核对 pointer、
+  generation、key、n、k；非 reuse-B 路径不启用 cache。
+
+计算线程统一受进程 CPU affinity 与 `PRL_CPU_THREADS` 限制，默认预算为 affinity 内的 CPU
+数量。prep/OpenMP/BLAKE3 与 proof/Rayon 分配不同额度；不代表进程全部 OS 线程数上限
+（I/O、NPU 控制线程及休眠的 pool worker 不计入）。`PRL_PREP_THREADS` 默认为约 3/4
+预算，最多总预算减 1；`PRL_PROOF_THREADS` 默认取剩余额度，也不能超过剩余额度。
+单 CPU 时 prep 与 proof/encoding 串行。`PRL_POW_THREADS` 在当前 NPU scan 中原本就不使用。
+proof 使用专用 Rayon pool，不修改全局 Rayon pool。无需新增 make 参数。
+
+直接运行二进制时，建议在启动前设置 `OMP_WAIT_POLICY=PASSIVE GOMP_SPINCOUNT=0`；
+`launch.sh` 已自动设置，避免空闲 OpenMP worker 自旋。miner 内也设置这两个变量，但
+部分 OpenMP runtime 可能在 main 前读取环境，故启动环境最可靠。
+
+相同 seed/key/dimension 的默认 zero-seed 数据、noise 公式和 proof 序列化格式保持一致。
+legacy random 填充仍按原有 thread 分片 RNG 生成；若统一预算改变实际线程数，同一个
+seed 的随机矩阵也可能不同（该行为本来就依赖线程数）。rank-128 的 NEON TBL 路径仅用于
+rank 128，其他 rank 回退到完整索引路径，避免原版本对大 rank 使用 128-entry table。
+本次仅修改源码并静态检查，按要求未编译、未执行测试或 benchmark；不提供实测提速百分比。

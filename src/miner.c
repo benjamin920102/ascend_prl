@@ -2,6 +2,8 @@
  * Usage: ascend_prl_<pool> <devid> <worker> <host> <port> <address> <password>
  */
 #include "pools/pool.h"
+#include "cpu_budget.h"
+#include <omp.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -20,27 +22,29 @@ extern void pearl_set_b(const int8_t *b, int n);
 extern void pearl_set_b_slot(const int8_t *b, int n, int slot) __attribute__((weak));
 extern void pearl_use_b(int slot) __attribute__((weak));
 extern void pearl_set_bt_slot(const int8_t *bt, int slot) __attribute__((weak));
-extern int prep_random(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *key,
+extern int prep_random_reuse(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *key,
                        int64_t m, int64_t n, int64_t k, int rank,
                        int8_t *An, int8_t *Btn, int8_t *EAL, int8_t *EBR,
                        uint8_t *rA, uint8_t *rB, uint8_t *cA, uint8_t *cB, int nt, int cert_version);
-extern int prep_random_bt(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *key,
+extern int prep_random_bt_reuse(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *key,
                           int64_t m, int64_t n, int64_t k, int rank,
                           int8_t *An, int8_t *bt_packed, int8_t *EAL, int8_t *EBR,
                           uint8_t *rA, uint8_t *rB, uint8_t *cA, uint8_t *cB, int nt, int cert_version);
-extern int prep_b_side(uint64_t seed, int8_t *B, const uint8_t *key,
+extern int prep_b_side_reuse(uint64_t seed, int8_t *B, const uint8_t *key,
                        int64_t n, int64_t k, int rank,
                        int8_t *bt_packed, int8_t *EBR, uint8_t *rootB, uint8_t *commitB, int nt, int cert_version);
-extern int prep_a_side(uint64_t seed, int8_t *A, const uint8_t *key, const uint8_t *commitB,
+extern int prep_a_side_reuse(uint64_t seed, int8_t *A, const uint8_t *key, const uint8_t *commitB,
                        int64_t m, int64_t k, int rank,
                        int8_t *An, int8_t *EAL, uint8_t *rootA, uint8_t *commitA, int nt, int cert_version);
 extern int scan_full(const int8_t *an, int nstrips, const uint8_t *key, const uint32_t *tgt,
                      int nbands, int n_hi, int pow_threads, uint32_t *scratch,
                      int *hs, int *ht);
-extern ssize_t build_proof_bin(const uint8_t *a, const uint8_t *b, size_t m, size_t n,
+extern ssize_t build_proof_bin_cached_b(const uint8_t *a, const uint8_t *b, size_t m, size_t n,
                                size_t k, size_t rank, const uint8_t *key,
                                const size_t *ar, size_t na, const size_t *bc, size_t nb,
-                               uint8_t *out, size_t cap);
+                               uint8_t *out, size_t cap, uint64_t b_generation);
+extern int proof_set_threads(size_t threads);
+extern void proof_clear_b_cache(void);
 extern int hash_key(const uint8_t *hdr, size_t hl, size_t k, size_t rank,
                     const size_t *rp, size_t nr, const size_t *cp, size_t nc, uint8_t *out);
 extern ssize_t encode_proof_b64(const uint8_t *bin, size_t bin_len, int gzip,
@@ -130,6 +134,7 @@ static struct {
     double diff; uint8_t ptarget[32];
     int cert_version;
     int slot, valid; long since;
+    uint64_t generation;
 } bs;
 
 // Refresh the cached B commitment on job changes or after PRL_BREUSE iterations.
@@ -146,11 +151,15 @@ static int ensure_bside(long N, long Kc, int rank, int prep_n) {
     if (!(jobchg || (refresh > 0 && bs.since >= refresh))) return 0;
     // Cached B must remain immutable while a queued proof borrows it.
     proof_drain();
+    proof_clear_b_cache();
+    if (++bs.generation == 0) ++bs.generation;
     snprintf(bs.job_id, JOBLEN, "%s", jid); bs.diff = diff; memcpy(bs.ptarget, pt, 32);
     bs.cert_version = cert_version;
     hash_key(hdr, hl, (size_t)Kc, (size_t)rank, mp.rows, mp.nrows, mp.cols, mp.ncols, bs.key);
     uint64_t seed = ((uint64_t)rand() << 32) ^ (uint64_t)time(0) ^ 0xB5B5ULL;
-    prep_check(prep_b_side(seed, bs.B, bs.key, N, Kc, rank, bs.bt, bs.EBR, bs.rootB, bs.commitB, prep_n, cert_version));
+    prl_cpu_enter();
+    prep_check(prep_b_side_reuse(seed, bs.B, bs.key, N, Kc, rank, bs.bt, bs.EBR, bs.rootB, bs.commitB, prep_n, cert_version));
+    prl_cpu_leave();
     if (pearl_set_bt_slot)     pearl_set_bt_slot(bs.bt, 0);
     else if (pearl_set_b_slot) pearl_set_b_slot(bs.bt, (int)N, 0);
     bs.slot = 0; bs.valid = 1; bs.since = 0;
@@ -162,17 +171,19 @@ static void *prep_worker(void *p) {
     double wait_start = monotonic_ms();
     proof_wait_bundle(b);
     if (getenv("PRL_LOOP_PROF")) fprintf(stderr, "[prepprof] proof-hold=%.1fms\n", monotonic_ms()-wait_start);
+    prl_cpu_enter();
     if (g_reuse_b) {
-        int prep_n = getenv("PRL_PREP_THREADS") ? atoi(getenv("PRL_PREP_THREADS")) : 64;
+        int prep_n = prl_cpu_prep_threads();
         struct timespec pa, pb; clock_gettime(CLOCK_MONOTONIC, &pa);
         uint64_t seed = ((uint64_t)rand() << 32) ^ (uint64_t)time(0);
         snprintf(b->job_id, JOBLEN, "%s", bs.job_id);
         b->diff = bs.diff; memcpy(b->ptarget, bs.ptarget, 32); memcpy(b->key, bs.key, 32);
         b->cert_version = bs.cert_version;
-        prep_check(prep_a_side(seed, b->A, bs.key, bs.commitB, mp.m, mp.k, (int)mp.rank,
+        prep_check(prep_a_side_reuse(seed, b->A, bs.key, bs.commitB, mp.m, mp.k, (int)mp.rank,
                     b->An, g_EAL, b->roots[0], b->roots[2], prep_n, bs.cert_version));
         clock_gettime(CLOCK_MONOTONIC, &pb);
         g_last_prep_ms = (pb.tv_sec - pa.tv_sec) * 1000 + (pb.tv_nsec - pa.tv_nsec) / 1000000;
+        prl_cpu_leave();
         return 0;
     }
     const char *ds = getenv("PRL_PREP_DELAY_MS");
@@ -186,18 +197,19 @@ static void *prep_worker(void *p) {
     struct timespec pa, pb;
     clock_gettime(CLOCK_MONOTONIC, &pa);
     uint64_t seed = ((uint64_t)rand() << 32) ^ (uint64_t)time(0);
-    int prep_n = getenv("PRL_PREP_THREADS") ? atoi(getenv("PRL_PREP_THREADS")) : 64;
+    int prep_n = prl_cpu_prep_threads();
     if (pearl_set_bt_slot) {
-        prep_check(prep_random_bt(seed, b->A, b->B, b->key, mp.m, mp.n, mp.k, (int)mp.rank,
+        prep_check(prep_random_bt_reuse(seed, b->A, b->B, b->key, mp.m, mp.n, mp.k, (int)mp.rank,
                        b->An, b->Btn, b->EAL, b->EBR,
                        b->roots[0], b->roots[1], b->roots[2], b->roots[3], prep_n, b->cert_version));
     } else {
-        prep_check(prep_random(seed, b->A, b->B, b->key, mp.m, mp.n, mp.k, (int)mp.rank,
+        prep_check(prep_random_reuse(seed, b->A, b->B, b->key, mp.m, mp.n, mp.k, (int)mp.rank,
                     b->An, b->Btn, b->EAL, b->EBR,
                     b->roots[0], b->roots[1], b->roots[2], b->roots[3], prep_n, b->cert_version));
     }
     clock_gettime(CLOCK_MONOTONIC, &pb);
     g_last_prep_ms = (pb.tv_sec - pa.tv_sec) * 1000 + (pb.tv_nsec - pa.tv_nsec) / 1000000;
+    prl_cpu_leave();
     if (pearl_set_bt_slot)     pearl_set_bt_slot(b->Btn, b->slot);
     else if (pearl_set_b_slot) pearl_set_b_slot(b->Btn, (int)mp.n, b->slot);
     return 0;
@@ -256,10 +268,10 @@ static void process_proof(bundle_t *cur, uint8_t *bin, uint8_t *payload_buf) {
     for (size_t i = 0; i < mp.nrows; i++) rows_abs[i] = (size_t)row + mp.rows[i];
     for (size_t i = 0; i < mp.ncols; i++) cols_abs[i] = (size_t)col + mp.cols[i];
     double proof_start = monotonic_ms();
-    ssize_t bl = build_proof_bin((uint8_t *)cur->A, (uint8_t *)(g_reuse_b ? bs.B : cur->B),
+    ssize_t bl = build_proof_bin_cached_b((uint8_t *)cur->A, (uint8_t *)(g_reuse_b ? bs.B : cur->B),
                                  (size_t)M, (size_t)N, (size_t)Kc, (size_t)mp.rank,
                                  cur->key, rows_abs, mp.nrows, cols_abs, mp.ncols,
-                                 bin, 64 << 20);
+                                 bin, 64 << 20, g_reuse_b ? bs.generation : 0);
     double proof_end = monotonic_ms();
     if (bl > 0) {
         pool_conn_t *sc = &user_conn;
@@ -329,7 +341,9 @@ static void *proof_worker(void *unused) {
         pthread_cond_broadcast(&proof_cv);
         pthread_mutex_unlock(&proof_mu);
         struct timespec a, z; clock_gettime(CLOCK_MONOTONIC, &a);
+        prl_cpu_enter();
         process_proof(b, bin, payload_buf);
+        prl_cpu_leave();
         clock_gettime(CLOCK_MONOTONIC, &z);
         if (getenv("PRL_LOOP_PROF")) fprintf(stderr, "[proofprof] proof+gzip+send=%.1fms\n",
             (z.tv_sec-a.tv_sec)*1e3 + (z.tv_nsec-a.tv_nsec)/1e6);
@@ -359,6 +373,16 @@ int main(int argc, char **argv) {
     }
     setvbuf(stdout, 0, _IOLBF, 0);
     g_reuse_b = getenv("PRL_REUSE_B") ? 1 : 0;
+    /* Keep sleeping OpenMP workers from spinning against the BLAKE3/proof teams. */
+    setenv("OMP_WAIT_POLICY", "PASSIVE", 1);
+    setenv("GOMP_SPINCOUNT", "0", 1);
+    omp_set_dynamic(0);
+    omp_set_max_active_levels(1);
+    if (proof_set_threads((size_t)prl_cpu_proof_threads())) {
+        fputs("[!] cannot initialize proof thread pool\n", stderr); return 2;
+    }
+    printf("[cpu] budget=%d prep/hash=%d proof=%d\n", prl_cpu_total(),
+           prl_cpu_prep_threads(), prl_cpu_proof_threads());
     pool_conn_init(&user_conn, "");
 
     POOL.init_params(&mp);
@@ -375,8 +399,8 @@ int main(int argc, char **argv) {
     bundle_t bun[2] = {0};
     for (int i = 0; i < 2; i++) {
         bun[i].slot = i;
-        bun[i].A = malloc((size_t)M * Kc);
-        if (!g_reuse_b) bun[i].B = malloc((size_t)N * Kc);
+        bun[i].A = calloc((size_t)M, (size_t)Kc);
+        if (!g_reuse_b) bun[i].B = calloc((size_t)N, (size_t)Kc);
         bun[i].An = pearl_pinned_alloc ? (int8_t *)pearl_pinned_alloc((size_t)M * Kc)
                                        : (int8_t *)malloc((size_t)M * Kc);
         if (!g_reuse_b) {
@@ -402,13 +426,13 @@ int main(int argc, char **argv) {
     }
 
     if (g_reuse_b) {
-        bs.B = malloc((size_t)N * Kc); bs.bt = pearl_pinned_alloc ? pearl_pinned_alloc((size_t)Kc * N) : malloc((size_t)Kc * N);
+        bs.B = calloc((size_t)N, (size_t)Kc); bs.bt = pearl_pinned_alloc ? pearl_pinned_alloc((size_t)Kc * N) : malloc((size_t)Kc * N);
         bs.EBR = malloc((size_t)N * mp.rank); bs.valid = 0;
         g_EAL = malloc((size_t)M * mp.rank);
         if (!bs.B || !bs.bt || !bs.EBR || !g_EAL) {
             fputs("[!] reuse-B allocation failed\n", stderr); exit(2);
         }
-        ensure_bside(N, Kc, (int)mp.rank, 64);
+        ensure_bside(N, Kc, (int)mp.rank, prl_cpu_prep_threads());
         printf("[reuse-B] enabled (PRL_BREUSE=%s, B-side cached per job)\n",
                getenv("PRL_BREUSE") ? getenv("PRL_BREUSE") : "0=job-change-only");
     }
@@ -431,11 +455,16 @@ int main(int argc, char **argv) {
         coexist_gate();
         if (g_reuse_b) {
             // A fresh B side invalidates the A prepared against the previous commitment.
-            int prep_n = getenv("PRL_PREP_THREADS") ? atoi(getenv("PRL_PREP_THREADS")) : 64;
+            int prep_n = prl_cpu_prep_threads();
             if (ensure_bside(N, Kc, (int)mp.rank, prep_n)) {
                 uint64_t s = ((uint64_t)rand() << 32) ^ (uint64_t)time(0) ^ 0xA5A5ULL;
-                prep_check(prep_a_side(s, cur->A, bs.key, bs.commitB, mp.m, mp.k, (int)mp.rank,
+                /* A queued proof can still borrow this bundle after the prep
+                 * join, so drain that borrow before repairing A for a new B. */
+                proof_wait_bundle(cur);
+                prl_cpu_enter();
+                prep_check(prep_a_side_reuse(s, cur->A, bs.key, bs.commitB, mp.m, mp.k, (int)mp.rank,
                             cur->An, g_EAL, cur->roots[0], cur->roots[2], prep_n, bs.cert_version));
+                prl_cpu_leave();
                 snprintf(cur->job_id, JOBLEN, "%s", bs.job_id);
                 cur->diff = bs.diff; memcpy(cur->ptarget, bs.ptarget, 32); memcpy(cur->key, bs.key, 32);
                 cur->cert_version = bs.cert_version;
@@ -482,6 +511,8 @@ int main(int argc, char **argv) {
     pthread_mutex_lock(&proof_mu); proof_stop = 1;
     pthread_cond_broadcast(&proof_cv); pthread_mutex_unlock(&proof_mu);
     pthread_join(proof_thread, 0);
+    proof_clear_b_cache();
+    prl_b3_shutdown();
     pool_stop_reader(&user_conn);
     return 0;
 }
