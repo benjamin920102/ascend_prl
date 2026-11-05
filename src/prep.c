@@ -1,8 +1,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <omp.h>
 #include "blake3.h"
+#include "blake3_impl.h" /* upstream BLAKE3 compression primitives and flag definitions */
 #include "cpu_budget.h"
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
@@ -98,7 +100,7 @@ static int zero_seed_enabled(void) {
 /* zero_initialized is an explicit caller contract: this allocation was initially
  * zeroed and has only been written by fill_buf since then. Never infer this
  * property from a recycled address. Legacy/external buffers still get memset. */
-static void fill_buf(int8_t *buf, int64_t total, uint64_t seed, int nt, int zero_initialized) {
+static int fill_buf(int8_t *buf, int64_t total, uint64_t seed, int nt, int zero_initialized) {
     if (!zero_seed_enabled()) {
 #pragma omp parallel num_threads(nt)
         {
@@ -114,7 +116,7 @@ static void fill_buf(int8_t *buf, int64_t total, uint64_t seed, int nt, int zero
                     buf[i++] = (int8_t)((uint8_t)v % 127) - 63;
             }
         }
-        return;
+        return 0;
     }
     if (!zero_initialized) memset(buf, 0, (size_t)total);
     if (total >= 8) {
@@ -123,6 +125,9 @@ static void fill_buf(int8_t *buf, int64_t total, uint64_t seed, int nt, int zero
             buf[i] = (int8_t)(s & 0xff);
     }
     (void)nt;
+    /* The caller may use the zero-seed fast path only under this explicit
+     * fill contract; no whole-matrix scan is needed to rediscover it. */
+    return 1;
 }
 
 static void calc_mk(const int8_t *buf, int64_t len, const uint8_t *key, uint8_t *root) {
@@ -134,6 +139,203 @@ static void calc_mk(const int8_t *buf, int64_t len, const uint8_t *key, uint8_t 
     blake3_hasher_update(&h, buf, (size_t)len);
 #endif
     blake3_hasher_finalize(&h, root, DIGEST);
+}
+
+/*
+ * Zero-seed Root Hash fast path.
+ *
+ * The miner's default shape is 16384 x 4096 = 64 MiB (65536 BLAKE3 chunks).
+ * We intentionally optimize only that exact full-chunk, power-of-two shape.
+ * Every other length/tree shape stays on calc_mk(), including partial final
+ * chunks and non-power-of-two chunk counts.
+ *
+ * Use the same low-level compression entry points as the linked upstream
+ * BLAKE3 C implementation. These are internal BLAKE3 C symbols, already
+ * linked by this project (blake3_join.c uses the same internal API family).
+ */
+#define PRL_B3_BLOCK_LEN       64u
+#define PRL_B3_CHUNK_LEN       1024u
+#define PRL_B3_KEYED_HASH      KEYED_HASH
+#define PRL_B3_CHUNK_START     CHUNK_START
+#define PRL_B3_CHUNK_END       CHUNK_END
+#define PRL_B3_PARENT          PARENT
+#define PRL_B3_ROOT            ROOT
+#define ZERO_SEED_CHUNK_COUNT   UINT64_C(65536)
+#define ZERO_SEED_CACHE_LEVELS  16u
+#define ZERO_SEED_PREFIX_LEN     8u
+#define ZERO_SEED_MATRIX_BYTES  ((size_t)ZERO_SEED_CHUNK_COUNT * PRL_B3_CHUNK_LEN)
+
+typedef struct {
+    uint8_t key[32];
+    size_t matrix_len;
+    uint64_t chunk_count;
+    uint8_t prefix_len;
+    uint8_t hash_flags;
+    uint8_t sibling_cv[ZERO_SEED_CACHE_LEVELS][DIGEST];
+    int valid;
+} zero_seed_cache_t;
+
+/* Cache data is immutable while a reader holds the read lock. A write lock is
+ * taken only on a cache miss/key change; readers copy the 512-byte CV ladder
+ * before releasing the lock, so later replacement cannot race with hashing. */
+static zero_seed_cache_t g_zero_seed_cache;
+static pthread_rwlock_t g_zero_seed_cache_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+static uint32_t prl_load32_le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void prl_store32_le(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static void zero_chunk_cv(uint64_t chunk_counter, const uint32_t key_words[8],
+                          const uint8_t *prefix, size_t prefix_len,
+                          uint8_t out_cv[DIGEST]) {
+    uint32_t cv[8];
+    uint8_t block[PRL_B3_BLOCK_LEN];
+    memcpy(cv, key_words, sizeof(cv));
+
+    for (unsigned block_index = 0; block_index < PRL_B3_CHUNK_LEN / PRL_B3_BLOCK_LEN; ++block_index) {
+        memset(block, 0, sizeof(block));
+        if (block_index == 0 && prefix && prefix_len) {
+            size_t n = prefix_len < sizeof(block) ? prefix_len : sizeof(block);
+            memcpy(block, prefix, n);
+        }
+        uint8_t flags = PRL_B3_KEYED_HASH;
+        if (block_index == 0) flags |= PRL_B3_CHUNK_START;
+        if (block_index + 1 == PRL_B3_CHUNK_LEN / PRL_B3_BLOCK_LEN)
+            flags |= PRL_B3_CHUNK_END;
+        /* BLAKE3 keeps the chunk counter constant across all 16 blocks. */
+        blake3_compress_in_place(cv, block, PRL_B3_BLOCK_LEN, chunk_counter, flags);
+    }
+
+    for (unsigned i = 0; i < 8; ++i) prl_store32_le(out_cv + i * 4, cv[i]);
+}
+
+static void zero_parent_cv(const uint8_t left_cv[DIGEST], const uint8_t right_cv[DIGEST],
+                           const uint32_t key_words[8], uint8_t out_cv[DIGEST]) {
+    uint8_t block[PRL_B3_BLOCK_LEN];
+    uint32_t cv[8];
+    memcpy(block, left_cv, DIGEST);
+    memcpy(block + DIGEST, right_cv, DIGEST);
+    memcpy(cv, key_words, sizeof(cv));
+    blake3_compress_in_place(cv, block, PRL_B3_BLOCK_LEN, 0,
+                             PRL_B3_KEYED_HASH | PRL_B3_PARENT);
+    for (unsigned i = 0; i < 8; ++i) prl_store32_le(out_cv + i * 4, cv[i]);
+}
+
+static void zero_root_finalize(const uint8_t left_cv[DIGEST], const uint8_t right_cv[DIGEST],
+                               const uint32_t key_words[8], uint8_t root[DIGEST]) {
+    uint8_t block[PRL_B3_BLOCK_LEN], output[64];
+    memcpy(block, left_cv, DIGEST);
+    memcpy(block + DIGEST, right_cv, DIGEST);
+    /* Root is an Output operation, not a raw parent chaining value. */
+    blake3_compress_xof(key_words, block, PRL_B3_BLOCK_LEN, 0,
+                        PRL_B3_KEYED_HASH | PRL_B3_PARENT | PRL_B3_ROOT, output);
+    memcpy(root, output, DIGEST);
+}
+
+/* Compute a complete, aligned, power-of-two subtree of all-zero chunks. */
+static void zero_subtree_cv(uint64_t first_chunk, unsigned level,
+                            const uint32_t key_words[8], uint8_t out_cv[DIGEST]) {
+    if (level == 0) {
+        zero_chunk_cv(first_chunk, key_words, NULL, 0, out_cv);
+        return;
+    }
+    uint8_t left_cv[DIGEST], right_cv[DIGEST];
+    uint64_t half = UINT64_C(1) << (level - 1);
+    zero_subtree_cv(first_chunk, level - 1, key_words, left_cv);
+    zero_subtree_cv(first_chunk + half, level - 1, key_words, right_cv);
+    zero_parent_cv(left_cv, right_cv, key_words, out_cv);
+}
+
+static int zero_seed_cache_matches(const uint8_t key[32], size_t matrix_len,
+                                   uint64_t chunk_count, uint8_t prefix_len,
+                                   uint8_t hash_flags) {
+    return g_zero_seed_cache.valid &&
+           g_zero_seed_cache.matrix_len == matrix_len &&
+           g_zero_seed_cache.chunk_count == chunk_count &&
+           g_zero_seed_cache.prefix_len == prefix_len &&
+           g_zero_seed_cache.hash_flags == hash_flags &&
+           memcmp(g_zero_seed_cache.key, key, 32) == 0;
+}
+
+static void zero_seed_cache_snapshot(const uint8_t key[32],
+                                     uint8_t sibling_cv[ZERO_SEED_CACHE_LEVELS][DIGEST]) {
+    const size_t matrix_len = ZERO_SEED_MATRIX_BYTES;
+    const uint64_t chunk_count = ZERO_SEED_CHUNK_COUNT;
+    const uint8_t prefix_len = ZERO_SEED_PREFIX_LEN;
+    const uint8_t hash_flags = PRL_B3_KEYED_HASH;
+
+    pthread_rwlock_rdlock(&g_zero_seed_cache_lock);
+    if (zero_seed_cache_matches(key, matrix_len, chunk_count, prefix_len, hash_flags)) {
+        memcpy(sibling_cv, g_zero_seed_cache.sibling_cv, sizeof(g_zero_seed_cache.sibling_cv));
+        pthread_rwlock_unlock(&g_zero_seed_cache_lock);
+        return;
+    }
+    pthread_rwlock_unlock(&g_zero_seed_cache_lock);
+
+    pthread_rwlock_wrlock(&g_zero_seed_cache_lock);
+    if (!zero_seed_cache_matches(key, matrix_len, chunk_count, prefix_len, hash_flags)) {
+        uint32_t key_words[8];
+        uint8_t built[ZERO_SEED_CACHE_LEVELS][DIGEST];
+        for (unsigned i = 0; i < 8; ++i) key_words[i] = prl_load32_le(key + i * 4);
+
+        /* Right siblings of chunk 0: [1], [2..3], ... [32768..65535].
+         * Each zero leaf is hashed once; only the 16 subtree roots survive. */
+        for (unsigned level = 0; level < ZERO_SEED_CACHE_LEVELS; ++level) {
+            uint64_t first_chunk = UINT64_C(1) << level;
+            zero_subtree_cv(first_chunk, level, key_words, built[level]);
+        }
+
+        g_zero_seed_cache.valid = 0;
+        memcpy(g_zero_seed_cache.key, key, 32);
+        g_zero_seed_cache.matrix_len = matrix_len;
+        g_zero_seed_cache.chunk_count = chunk_count;
+        g_zero_seed_cache.prefix_len = prefix_len;
+        g_zero_seed_cache.hash_flags = hash_flags;
+        memcpy(g_zero_seed_cache.sibling_cv, built, sizeof(built));
+        g_zero_seed_cache.valid = 1;
+    }
+    memcpy(sibling_cv, g_zero_seed_cache.sibling_cv, sizeof(g_zero_seed_cache.sibling_cv));
+    pthread_rwlock_unlock(&g_zero_seed_cache_lock);
+}
+
+/* Returns 1 only when the exact 64 MiB / 65536-chunk shape was optimized.
+ * The caller must supply the explicit fill_buf() zero-seed contract; this
+ * function deliberately reads only the 8-byte stamp and never scans the tail. */
+static int calc_mk_zero_seed_cached(const int8_t *buf, int64_t len,
+                                    const uint8_t *key, uint8_t *root) {
+    if (!buf || !key || !root || len != (int64_t)ZERO_SEED_MATRIX_BYTES)
+        return 0;
+
+    uint8_t siblings[ZERO_SEED_CACHE_LEVELS][DIGEST];
+    uint32_t key_words[8];
+    uint8_t current[DIGEST], next[DIGEST];
+    for (unsigned i = 0; i < 8; ++i) key_words[i] = prl_load32_le(key + i * 4);
+
+    zero_seed_cache_snapshot(key, siblings);
+    zero_chunk_cv(0, key_words, (const uint8_t *)buf, ZERO_SEED_PREFIX_LEN, current);
+
+    /* Merge chunk 0 with each cached right sibling in BLAKE3's left/right order.
+     * The final level must emit ROOT output, not merely a parent CV. */
+    for (unsigned level = 0; level + 1 < ZERO_SEED_CACHE_LEVELS; ++level) {
+        zero_parent_cv(current, siblings[level], key_words, next);
+        memcpy(current, next, DIGEST);
+    }
+    zero_root_finalize(current, siblings[ZERO_SEED_CACHE_LEVELS - 1], key_words, root);
+    return 1;
+}
+
+static void calc_mk_filled(const int8_t *buf, int64_t len, const uint8_t *key,
+                           uint8_t *root, int known_zero_seed) {
+    if (known_zero_seed && calc_mk_zero_seed_cached(buf, len, key, root)) return;
+    calc_mk(buf, len, key, root);
 }
 
 static void unif_int8(const uint8_t *seed, const uint8_t *key, int64_t nbytes, int8_t *out, int nt) {
@@ -342,14 +544,14 @@ static int prep_from_ab_impl(const int8_t *A, const int8_t *B, const uint8_t *ke
                  int8_t *EAL, int8_t *EBR,
                  uint8_t *rootA, uint8_t *rootB,
                  uint8_t *commitA, uint8_t *commitB,
-                 int nt, int pack, int cert_mode, int zero_a) {
+                 int nt, int pack, int cert_mode, int zero_a, int zero_b) {
     if (nt < 1 || nt > prl_cpu_prep_threads()) nt = prl_cpu_prep_threads();
     if ((m * k) % 1024 || (n * k) % 1024) return -1;
 
     /* The persistent hash team already fills the prep partition. Avoid two
      * independent root callers competing for that same helper budget. */
-    calc_mk(A, m * k, key, rootA);
-    calc_mk(B, n * k, key, rootB);
+    calc_mk_filled(A, m * k, key, rootA, zero_a);
+    calc_mk_filled(B, n * k, key, rootB, zero_b);
 
     uint8_t saltedA[32], saltedB[32];
     salt_roots(cert_mode, rootA, rootB, (uint32_t)m, (uint32_t)n, saltedA, saltedB);
@@ -389,7 +591,7 @@ int prep_from_ab(const int8_t *A, const int8_t *B, const uint8_t *key,
                  int nt, int cert_version) {
     int cert_mode = cert_version >= 3 ? CERT_SALTED : CERT_LEGACY;
     return prep_from_ab_impl(A, B, key, m, n, k, R, A_noised, Bt_noised,
-                             EAL, EBR, rootA, rootB, commitA, commitB, nt, 0, cert_mode, 0);
+                             EAL, EBR, rootA, rootB, commitA, commitB, nt, 0, cert_mode, 0, 0);
 }
 
 static int prep_random_impl(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *key,
@@ -398,10 +600,11 @@ static int prep_random_impl(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *
                             uint8_t *rootA, uint8_t *rootB, uint8_t *commitA, uint8_t *commitB,
                             int nt, int pack, int cert_mode, int zero_initialized) {
     if (nt < 1 || nt > prl_cpu_prep_threads()) nt = prl_cpu_prep_threads();
-    fill_buf(A, m * k, seed, nt, zero_initialized);
-    fill_buf(B, n * k, seed ^ 0xB0B0B0B0ULL, nt, zero_initialized);
+    int zero_a = fill_buf(A, m * k, seed, nt, zero_initialized);
+    int zero_b = fill_buf(B, n * k, seed ^ 0xB0B0B0B0ULL, nt, zero_initialized);
     return prep_from_ab_impl(A, B, key, m, n, k, R, A_noised, Bt_out,
-                             EAL, EBR, rootA, rootB, commitA, commitB, nt, pack, cert_mode, zero_seed_enabled());
+                             EAL, EBR, rootA, rootB, commitA, commitB, nt, pack,
+                             cert_mode, zero_a, zero_b);
 }
 
 int prep_random(uint64_t seed, int8_t *A, int8_t *B, const uint8_t *key,
@@ -432,8 +635,8 @@ static int prep_b_side_impl(uint64_t seed, int8_t *B, const uint8_t *key,
     if ((n * k) % 1024) return -1;
     if (k > (1 << 16)) return -2;
 
-    fill_buf(B, n * k, seed, nt, zero_initialized);
-    calc_mk(B, n * k, key, rootB);
+    int zero_seed = fill_buf(B, n * k, seed, nt, zero_initialized);
+    calc_mk_filled(B, n * k, key, rootB, zero_seed);
 
     int cert_mode = cert_version >= 3 ? CERT_SALTED : CERT_LEGACY;
     uint8_t saltedB[32];
@@ -465,8 +668,8 @@ static int prep_a_side_impl(uint64_t seed, int8_t *A, const uint8_t *key, const 
     if ((m * k) % 1024) return -1;
     if (k > (1 << 16)) return -2;
 
-    fill_buf(A, m * k, seed, nt, zero_initialized);
-    calc_mk(A, m * k, key, rootA);
+    int zero_seed = fill_buf(A, m * k, seed, nt, zero_initialized);
+    calc_mk_filled(A, m * k, key, rootA, zero_seed);
 
     int cert_mode = cert_version >= 3 ? CERT_SALTED : CERT_LEGACY;
     uint8_t saltedA[32];
@@ -485,7 +688,7 @@ static int prep_a_side_impl(uint64_t seed, int8_t *A, const uint8_t *key, const 
     uint16_t *sA = fA + k;
     perm_pairs(seedA, commitA, k, R, fA, sA);
 
-    compute_an(A, EAL, A_noised, fA, sA, m, k, R, nt, zero_seed_enabled());
+    compute_an(A, EAL, A_noised, fA, sA, m, k, R, nt, zero_seed);
     free(fA);
     return 0;
 }
