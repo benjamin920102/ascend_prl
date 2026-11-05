@@ -178,3 +178,22 @@ legacy random 填充仍按原有 thread 分片 RNG 生成；若统一预算改�
 seed 的随机矩阵也可能不同（该行为本来就依赖线程数）。rank-128 的 NEON TBL 路径仅用于
 rank 128，其他 rank 回退到完整索引路径，避免原版本对大 rank 使用 128-entry table。
 本次仅修改源码并静态检查，按要求未编译、未执行测试或 benchmark；不提供实测提速百分比。
+
+## BLAKE3 Vector64 正式版（僅 Vector Hash）
+
+正式 Vector Kernel **一律使用 64-way Memory-based Vector** 執行 BLAKE3 Keyed
+Hash，直接讀取原有 `16 × 64` Transcript SoA，完整計算七輪壓縮及八個 Hash Words。
+**不再保留 Scalar BLAKE3、Scalar Fallback、診斷模式或 Vector64 切換編譯參數。**
+Host 強制要求 `n_hi=64`，不符合時直接報錯，避免悄悄切換回 Scalar。
+目前兩種 Pool Profile 都使用 `nrows=2`，所以 `n_hi=128/2=64`。
+
+原本的 256-bit Target 比較仍逐 Lane 讀取 Vector64 已完成的八個 Hash Words，
+以維持原本 Hit 判定順序及 Proof 格式。**這部分是 Scalar Target 比較，
+不是 Scalar BLAKE3 Hash。**
+
+重用 Fold 完成後 `foldB` 的 7,424 Bytes（原本共 16 KiB UB），沒有新增 TBuf
+或 Kernel Launch。GRID=20、VEC2X=2、BUFS=4，Cube/Fold/Proof 均維持原設定。
+
+獨立 910B4 Benchmark 的 2.3774x 來自只計時第一個輸出 Word 的測試；
+八個 Words 的正確性另外驗證。此數字不代表正式版 TH/s。
+本版遵照要求未編譯、未執行測試，尚未經 910B4／910C 實機確認。
