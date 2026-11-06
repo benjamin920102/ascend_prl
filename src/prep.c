@@ -28,15 +28,28 @@ static const uint8_t SEED_SALT_B[32] = {
     0x1a, 0xe9, 0xc6, 0x39, 0x88, 0xe8, 0xcc, 0x04, 0x48, 0x44, 0x30, 0x1d, 0x71, 0xb8, 0x9a, 0xa9,
 };
 
+static uint32_t prl_load32_le(const uint8_t *p);
+
+/* A single full chunk block is also the root Output. The XOF entry point
+ * serializes the root bytes; compress_in_place would instead return a CV. */
+static inline void prl_blake3_keyed_64_direct(const uint8_t key[32],
+                                             const uint8_t msg[64],
+                                             uint8_t out[DIGEST]) {
+    uint32_t key_words[8];
+    uint8_t xof[64];
+    for (unsigned i = 0; i < 8; ++i)
+        key_words[i] = prl_load32_le(key + 4 * i);
+    blake3_compress_xof(key_words, msg, 64, 0,
+                        KEYED_HASH | CHUNK_START | CHUNK_END | ROOT, xof);
+    memcpy(out, xof, DIGEST);
+}
+
 // Hash a fixed 64-byte block: root || dimension (LE u32) || 28 zero bytes.
 static void bind_root(const uint8_t root[32], uint32_t dim, const uint8_t salt[32], uint8_t out[32]) {
     uint8_t msg[64] = {0};
     memcpy(msg, root, 32);
     memcpy(msg + 32, &dim, 4);
-    blake3_hasher h;
-    blake3_hasher_init_keyed(&h, salt);
-    blake3_hasher_update(&h, msg, 64);
-    blake3_hasher_finalize(&h, out, DIGEST);
+    prl_blake3_keyed_64_direct(salt, msg, out);
 }
 
 #define CERT_LEGACY 0
@@ -82,10 +95,7 @@ static void draw_hash(uint32_t idx, const uint8_t *seed, const uint8_t *key,
     uint32_t v = idx + 1;
     memcpy(msg + slot * 4, &v, 4);
     memcpy(msg + 32, seed, 32);
-    blake3_hasher h;
-    blake3_hasher_init_keyed(&h, key);
-    blake3_hasher_update(&h, msg, 64);
-    blake3_hasher_finalize(&h, out, DIGEST);
+    prl_blake3_keyed_64_direct(key, msg, out);
 }
 
 /*
@@ -338,6 +348,23 @@ static void calc_mk_filled(const int8_t *buf, int64_t len, const uint8_t *key,
     calc_mk(buf, len, key, root);
 }
 
+/* n is at most DIGEST; all transformed values lie in [-32, 31]. */
+static inline void noise_digest_store(const uint8_t d[DIGEST], int8_t *out, int64_t n) {
+#ifdef HAVE_NEON
+    if (n == DIGEST) {
+        uint8x16_t mask = vdupq_n_u8(RANGE_MASK);
+        int8x16_t zero = vdupq_n_s8(ZERO_POINT);
+        uint8x16_t lo = vandq_u8(vld1q_u8(d), mask);
+        uint8x16_t hi = vandq_u8(vld1q_u8(d + 16), mask);
+        vst1q_s8(out, vsubq_s8(vreinterpretq_s8_u8(lo), zero));
+        vst1q_s8(out + 16, vsubq_s8(vreinterpretq_s8_u8(hi), zero));
+        return;
+    }
+#endif
+    for (int64_t j = 0; j < n; ++j)
+        out[j] = (int8_t)((d[j] & RANGE_MASK) - ZERO_POINT);
+}
+
 static void unif_int8(const uint8_t *seed, const uint8_t *key, int64_t nbytes, int8_t *out, int nt) {
     int64_t draws = (nbytes + DIGEST - 1) / DIGEST;
 
@@ -347,28 +374,16 @@ static void unif_int8(const uint8_t *seed, const uint8_t *key, int64_t nbytes, i
         draw_hash((uint32_t)i, seed, key, 0, d);
         int64_t off = i * DIGEST, n = nbytes - off;
         if (n > DIGEST) n = DIGEST;
-        // Transform each digest before writing it, avoiding a second pass over EAL/EBR.
-#ifdef HAVE_NEON
-        if (n == DIGEST) {
-            uint8x16_t mask = vdupq_n_u8(RANGE_MASK);
-            int8x16_t zero = vdupq_n_s8(ZERO_POINT);
-            uint8x16_t lo = vandq_u8(vld1q_u8(d), mask);
-            uint8x16_t hi = vandq_u8(vld1q_u8(d + 16), mask);
-            vst1q_s8(out + off, vsubq_s8(vreinterpretq_s8_u8(lo), zero));
-            vst1q_s8(out + off + 16, vsubq_s8(vreinterpretq_s8_u8(hi), zero));
-            continue;
-        }
-#endif
-        for (int64_t j = 0; j < n; j++) {
-            out[off + j] = (int8_t)((d[j] & RANGE_MASK) - ZERO_POINT);
-        }
+        noise_digest_store(d, out + off, n);
     }
 }
 
 // Each index pair is deterministically derived from the commitment; XOR ensures
 // the second rank index differs from the first without a rejection loop.
-static void perm_pairs(const uint8_t *seed, const uint8_t *key, int64_t lines, int rank,
-                       uint16_t *first, uint16_t *second) {
+static inline void perm_pairs_impl(const uint8_t *seed, const uint8_t *key,
+                                    int64_t lines, int rank,
+                                    uint16_t *first, uint16_t *second,
+                                    uint8_t *first8, uint8_t *second8) {
     int64_t draws = (lines * 4 + DIGEST - 1) / DIGEST;
     for (int64_t i = 0; i < draws; i++) {
         uint8_t d[DIGEST];
@@ -380,15 +395,34 @@ static void perm_pairs(const uint8_t *seed, const uint8_t *key, int64_t lines, i
             memcpy(&u, d + j * 4, 4);
             uint32_t f = u & (uint32_t)(rank - 1);
             uint32_t s = f ^ (1u + (uint32_t)(((uint64_t)(rank - 1) * u) >> 32));
-            first[line] = (uint16_t)f;
-            second[line] = (uint16_t)s;
+            if (first8) { /* Only the rank-128 wrapper supplies byte outputs. */
+                first8[line] = (uint8_t)f;
+                second8[line] = (uint8_t)s;
+            } else {
+                first[line] = (uint16_t)f;
+                second[line] = (uint16_t)s;
+            }
         }
     }
 }
 
+static void perm_pairs(const uint8_t *seed, const uint8_t *key, int64_t lines, int rank,
+                       uint16_t *first, uint16_t *second) {
+    perm_pairs_impl(seed, key, lines, rank, first, second, NULL, NULL);
+}
+
+#if defined(__aarch64__)
+static void perm_pairs_u8(const uint8_t *seed, const uint8_t *key, int64_t lines,
+                          uint8_t *first, uint8_t *second) {
+    /* f = u & 127; 1 + floor(127*u/2^32) is in [1,127],
+     * so both f and its XOR partner are representable without truncation. */
+    perm_pairs_impl(seed, key, lines, 128, NULL, NULL, first, second);
+}
+#endif
+
 /* AArch64 TBL gathers 16 noise values directly from register tables.
- * Keep the uint16_t permutation representation for ranks > 256 and use the
- * low byte only in this rank-128 specialization (all indices are < 128).
+ * The original uint16_t entry point remains available for B and fallback;
+ * fused A uses byte indices directly (all rank-128 indices are < 128).
  * Two disjoint 64-byte lookups return zero outside their respective ranges.
  */
 #if defined(__aarch64__)
@@ -431,6 +465,52 @@ static inline void noise128_apply(noise128_t t, const int8_t *src, int8_t *dst,
                                  - vgetq_lane_s8(noise128_gather(t, si), 0));
     }
 }
+
+static inline void noise128_apply_u8(noise128_t t, const int8_t *src, int8_t *dst,
+                                     const uint8_t *f, const uint8_t *s,
+                                     int64_t count) {
+    int64_t j = 0;
+    for (; j + 16 <= count; j += 16) {
+        int8x16_t vf = noise128_gather(t, vld1q_u8(f + j));
+        int8x16_t vs = noise128_gather(t, vld1q_u8(s + j));
+        int8x16_t va = src ? vld1q_s8(src + j) : vdupq_n_s8(0);
+        vst1q_s8(dst + j, vsubq_s8(vaddq_s8(va, vf), vs));
+    }
+    for (; j < count; ++j) {
+        int value = (src ? src[j] : 0)
+                  + vgetq_lane_s8(noise128_gather(t, vdupq_n_u8(f[j])), 0)
+                  - vgetq_lane_s8(noise128_gather(t, vdupq_n_u8(s[j])), 0);
+        /* Store the low byte through a character type: explicit modulo 256,
+         * without out-of-range signed conversion or pointer reinterpretation. */
+        ((unsigned char *)dst)[j] = (unsigned char)value;
+    }
+}
+
+static void compute_an128_fused(const int8_t *A, const uint8_t *seed,
+                                const uint8_t *key, int8_t *EAL, int8_t *out,
+                                const uint8_t *f, const uint8_t *s,
+                                int64_t m, int64_t k, int nt, int zero_seed) {
+#pragma omp parallel for schedule(static) num_threads(nt)
+    for (int64_t r = 0; r < m; ++r) {
+        int8_t row[128];
+        for (unsigned q = 0; q < 4; ++q) {
+            uint8_t d[DIGEST];
+            /* Exactly the original linear draw index, including uint32 wrap. */
+            draw_hash((uint32_t)(4 * r + q), seed, key, 0, d);
+            noise_digest_store(d, row + q * DIGEST, DIGEST);
+        }
+        /* EAL remains a complete public output. Gather reads the local row,
+         * not a later second pass over the full shared noise allocation. */
+        memcpy(EAL + r * 128, row, sizeof(row));
+        noise128_apply_u8(noise128_load(row), zero_seed ? NULL : A + r * k,
+                           out + r * k, f, s, k);
+    }
+    /* Match compute_an's seed-stamp addition after the implicit OMP barrier. */
+    if (zero_seed && m * k >= 8)
+        for (int i = 0; i < 8; ++i)
+            ((unsigned char *)out)[i] = (unsigned char)((int)out[i] + A[i]);
+}
+
 #endif
 
 static void compute_an(const int8_t *A, const int8_t *EAL, int8_t *out,
@@ -466,6 +546,31 @@ static void compute_an(const int8_t *A, const int8_t *EAL, int8_t *out,
      * Add with int8 wrap, exactly as in the ordinary A+noise path. */
     if (zero_seed && m * k >= 8)
         for (int i = 0; i < 8; ++i) out[i] = (int8_t)(out[i] + A[i]);
+}
+
+/* Private dispatcher: public EAL ownership and all API signatures stay intact.
+ * Index storage is allocated once per A preparation, never once per row. */
+static int prepare_an(const int8_t *A, const uint8_t *seed, const uint8_t *key,
+                       int8_t *EAL, int8_t *out, int64_t m, int64_t k,
+                       int R, int nt, int zero_seed) {
+#if defined(__aarch64__)
+    if (R == 128) {
+        uint8_t *pairs = malloc((size_t)k * 2);
+        if (!pairs) return -3;
+        perm_pairs_u8(seed, key, k, pairs, pairs + k);
+        compute_an128_fused(A, seed, key, EAL, out, pairs, pairs + k,
+                            m, k, nt, zero_seed);
+        free(pairs);
+        return 0;
+    }
+#endif
+    uint16_t *pairs = malloc((size_t)k * 2 * sizeof(*pairs));
+    if (!pairs) return -3;
+    perm_pairs(seed, key, k, R, pairs, pairs + k);
+    unif_int8(seed, key, m * R, EAL, nt);
+    compute_an(A, EAL, out, pairs, pairs + k, m, k, R, nt, zero_seed);
+    free(pairs);
+    return 0;
 }
 
 #define TB 64
@@ -564,17 +669,16 @@ static int prep_from_ab_impl(const int8_t *A, const int8_t *B, const uint8_t *ke
     blake3_hasher_update(&h, saltedA, 32); blake3_hasher_finalize(&h, commitA, 32);
 
     static const uint8_t seedA[32] = "A_tensor", seedB[32] = "B_tensor";
-    unif_int8(seedA, commitA, m * R, EAL, nt);
     unif_int8(seedB, commitB, n * R, EBR, nt);
 
     if (k > (1 << 16)) return -2;
-    uint16_t *pairs = malloc((size_t)k * 4 * sizeof(*pairs));
+    uint16_t *pairs = malloc((size_t)k * 2 * sizeof(*pairs));
     if (!pairs) return -3;
-    uint16_t *fA = pairs, *sA = fA + k, *fB = sA + k, *sB = fB + k;
-    perm_pairs(seedA, commitA, k, R, fA, sA);
+    uint16_t *fB = pairs, *sB = fB + k;
     perm_pairs(seedB, commitB, k, R, fB, sB);
 
-    compute_an(A, EAL, A_noised, fA, sA, m, k, R, nt, zero_a);
+    int rc = prepare_an(A, seedA, commitA, EAL, A_noised, m, k, R, nt, zero_a);
+    if (rc) { free(pairs); return rc; }
     if (pack) {
         compute_bn_pack(B, EBR, Bt_out, fB, sB, k, n, R, nt);
     } else {
@@ -681,16 +785,8 @@ static int prep_a_side_impl(uint64_t seed, int8_t *A, const uint8_t *key, const 
     blake3_hasher_update(&h, saltedA, 32); blake3_hasher_finalize(&h, commitA, 32);
 
     static const uint8_t seedA[32] = "A_tensor";
-    unif_int8(seedA, commitA, m * R, EAL, nt);
 
-    uint16_t *fA = malloc((size_t)k * 2 * sizeof(*fA));
-    if (!fA) return -3;
-    uint16_t *sA = fA + k;
-    perm_pairs(seedA, commitA, k, R, fA, sA);
-
-    compute_an(A, EAL, A_noised, fA, sA, m, k, R, nt, zero_seed);
-    free(fA);
-    return 0;
+    return prepare_an(A, seedA, commitA, EAL, A_noised, m, k, R, nt, zero_seed);
 }
 
 /* Existing APIs clear arbitrary input storage; the *_reuse variants require
