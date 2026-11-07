@@ -10,6 +10,7 @@
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
+#include "prl_blake3_neon4.h"
 #define HAVE_NEON 1
 #endif
 
@@ -441,11 +442,12 @@ static void compute_an128_fused_stamp(const int8_t *A, const uint8_t *seed,
 #pragma omp parallel for schedule(static) num_threads(nt)
     for (int64_t r = 0; r < m; ++r) {
         int8_t row[PRL_RANK];
-        for (unsigned q = 0; q < PRL_RANK / DIGEST; ++q) {
-            uint8_t d[DIGEST];
-            draw_hash((uint32_t)((PRL_RANK / DIGEST) * r + q), seed, key, 0, d);
-            noise_digest_store(d, row + q * DIGEST, DIGEST);
-        }
+        /* Four independent BLAKE3 keyed roots, one per NEON 32-bit lane.
+         * Exact message order is draw=4*r+q; output remains 4*32 bytes. */
+        uint8_t digests[4][DIGEST];
+        prl_blake3_a_noise4_neon((uint32_t)(4 * (uint64_t)r), seed, key, digests);
+        for (unsigned q = 0; q < 4; ++q)
+            noise_digest_store(digests[q], row + q * DIGEST, DIGEST);
         memcpy(EAL + r * PRL_RANK, row, sizeof(row));
         noise128_apply_u8(noise128_load(row), NULL, out + r * k, f, s, k);
     }
@@ -462,11 +464,12 @@ static void compute_an128_fused_raw(const int8_t *A, const uint8_t *seed,
 #pragma omp parallel for schedule(static) num_threads(nt)
     for (int64_t r = 0; r < m; ++r) {
         int8_t row[PRL_RANK];
-        for (unsigned q = 0; q < PRL_RANK / DIGEST; ++q) {
-            uint8_t d[DIGEST];
-            draw_hash((uint32_t)((PRL_RANK / DIGEST) * r + q), seed, key, 0, d);
-            noise_digest_store(d, row + q * DIGEST, DIGEST);
-        }
+        /* Four independent BLAKE3 keyed roots, one per NEON 32-bit lane.
+         * Exact message order is draw=4*r+q; output remains 4*32 bytes. */
+        uint8_t digests[4][DIGEST];
+        prl_blake3_a_noise4_neon((uint32_t)(4 * (uint64_t)r), seed, key, digests);
+        for (unsigned q = 0; q < 4; ++q)
+            noise_digest_store(digests[q], row + q * DIGEST, DIGEST);
         memcpy(EAL + r * PRL_RANK, row, sizeof(row));
         noise128_apply_u8(noise128_load(row), A + r * k, out + r * k, f, s, k);
     }

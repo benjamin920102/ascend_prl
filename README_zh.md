@@ -191,3 +191,17 @@ Host 強制要求 `n_hi=64`，不符合時直接報錯，避免悄悄切換回 S
 獨立 910B4 Benchmark 的 2.3774x 來自只計時第一個輸出 Word 的測試；
 八個 Words 的正確性另外驗證。此數字不代表正式版 TH/s。
 本版遵照要求未編譯、未執行測試，尚未經 910B4／910C 實機確認。
+
+
+## A 噪聲 BLAKE3 4-way NEON（ARM64）
+
+`src/prep.c` 的 A 行噪聲產生（`compute_an128_fused_stamp`、
+`compute_an128_fused_raw`）固定為 rank=128；每列原本依序計算 4 個
+64-byte Keyed BLAKE3 digest。現在透過 `src/prl_blake3_neon4.h` 的
+4 個 32-bit NEON lanes 同時計算 4 個獨立 BLAKE3 root。
+
+- 訊息位元組不變：`LE32(draw+1) || 28*0 || seed[32]`。
+- 7 rounds、KEYED_HASH/CHUNK_START/CHUNK_END/ROOT flags、輸出前 32 bytes 不變。
+- `noise_digest_store`、rank-128 TBL、A seed stamp、原始 A/commit hash、B 路徑不變。
+- 非 aarch64 平台保留原有可攜式 A 路徑；沒有新增執行期開關。
+- 本變更不代表整體礦工 TH/s 實測提升；效益須在目標 910B 主機量測。
