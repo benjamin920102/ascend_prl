@@ -74,14 +74,13 @@ PRL_COEXIST_GUARD=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./scripts/launch.s
   请在 `proof-ffi/Cargo.toml` 中把路径改成你本地的检出目录。
 
 ```bash
-make                     # 默认 RANK=128；生成 build/{ascend_prl_kryptex, ascend_prl_k1, libpearl_hlc2.so, libpearl_proof.so}
+make                     # 固定 rank=128、K=4096；生成全部正式版构建产物
 ```
 
 编译选项（`make 变量=...`）：
 
 | 选项 | 默认 | 含义 |
 | ---- | ------- | ------- |
-| `RANK` | `128` | 噪声 rank / 算子配置。当前公开矿池只接受 `128`（K=4096）。 |
 | `MDIM` | `16384` | 16384 可让矿池的区块证明（block-proof）足够快，避免产生孤块（orphan）。 |
 
 ## 性能与形状
@@ -91,8 +90,7 @@ Cube 单元无法做异或（XOR）与移位，而 Vector 单元不擅长矩阵�
 TH/s ~ OP/s / 2 =（内存带宽）×（fold 的算术强度）。我们总共搬运 8/r 字节 → 算术强度 = r/8。
 所以硅片理论峰值约为 rank / 8 TH/s。
 
-币种规范允许 r 最高到 1024，但要求 k ≥ r×16，而 ZK 证明的大小与校验时间随 k 线性增长。
-k 增大会拉长区块处理时间，从而提高产生孤块的概率。当前公开矿池只接受 r=128。其他 rank 仅保留用于自定义/非公开矿池实验。
+币种规范允许其他 rank，但本正式版源代码固定 `r=128`、`K=4096`、`NINNER=1`、`NFOLD=32`，不再提供编译或运行时的 rank 选择。
 
 > 注意：**昇腾 310** 和 **950** 没有上述限制，理论上可以更接近硬件峰值 TOP/s。
 
@@ -103,8 +101,8 @@ k 增大会拉长区块处理时间，从而提高产生孤块的概率。当前
 
 1. `mining.authorize` 发送 `"type":"v2"`。矿池在应答中回显 `"type":"v2"` 后，矿工提交
    `base64(gzip(bincode(plain_proof)))`，而不是约 136 KB 的明文 base64 证明（压缩后约 15 KB）。
-2. 矩阵 A/B **默认以零填充**（外加 8 字节 seed 戳），使证明高度可重复、真正可被 gzip 压缩。
-   均匀随机数据几乎压不动。仅在需要旧版随机填充时设置 `PRL_ZERO_SEED=0`。
+2. 矩阵 A/B **始终零填充**（仅前 8 字节写入 seed 戳），证明可被 gzip 高效压缩。
+   旧版随机填充与对应环境变量开关已彻底移除。
 
 **自定义份额难度**（[说明](https://gist.github.com/maxmalysh/f4c29f532e650a114b317e234f1393fb)）：
 把 CLI 第 6 个参数（password）设为 `d=<N>`。例如高算力矿机目标约每 30 秒一个份额：
@@ -120,7 +118,6 @@ password 为空 → 使用矿池默认（`d=2097152` ≈ 9000 TH）。公式：
 | --- | --- |
 | `PRL_NOGZIP` | 强制 v1（不发 `"type":"v2"`，明文证明） |
 | `PRL_GZIP` | 不等 authorize 应答就假定启用 gzip |
-| `PRL_ZERO_SEED=0` | 旧版随机 A/B 填充（不可压缩，不推荐） |
 | `PRL_GZIP_FIELD` | 覆盖 submit 字段名（默认仍为 `plain_proof`） |
 
 ## 矿池兼容性
@@ -149,11 +146,10 @@ MIT —— 见 [LICENSE](LICENSE)。按**「现状」提供，不作任何担保
 
 ### Host CPU 优化
 
-- 默认 zero-seed：原始 A/B 改用 `calloc` 初始化，此后每轮只覆盖前 8 bytes seed；
+- 固定 zero-seed：原始 A/B 以 `calloc` 初始化，此后每轮只覆盖前 8 bytes seed；
   A noise 直接从零基底生成，最后以 int8 wrap 补回 seed stamp。原始矩阵仍完整保留给
-  Merkle hash 和 proof，因此这里只消除 noise 阶段的 A 全量读取，不消除 Merkle 读取。
-  `PRL_ZERO_SEED=0` 仍执行完整随机填充。内部 `*_reuse` API 要求 buffer 首次清零、
-  后续只由生成器写入，且 buffer 生命周期内不切换填充模式；旧 API 仍清零任意输入 buffer。
+  Merkle hash 和 proof，因此这里只消除 noise 阶段的 A 全量读取。
+  内部 `*_reuse` API 要求 buffer 初次清零、后续只由生成器写入；普通 API 每次先清零。
 - BLAKE3：首次大 hash 懒初始化持久 pthread pool，之后复用；无空闲 worker 时在调用线程
   计算，不阻塞等待可用 worker。prep 的 A/B root 顺序提交，同一个 hash 可使用整个 prep
   额度。OpenMP 与 BLAKE3 是先后执行的阶段。正常退出时先排空 prep/proof，再关闭 pool。
@@ -173,11 +169,9 @@ proof 使用专用 Rayon pool，不修改全局 Rayon pool。无需新增 make �
 `launch.sh` 已自动设置，避免空闲 OpenMP worker 自旋。miner 内也设置这两个变量，但
 部分 OpenMP runtime 可能在 main 前读取环境，故启动环境最可靠。
 
-相同 seed/key/dimension 的默认 zero-seed 数据、noise 公式和 proof 序列化格式保持一致。
-legacy random 填充仍按原有 thread 分片 RNG 生成；若统一预算改变实际线程数，同一个
-seed 的随机矩阵也可能不同（该行为本来就依赖线程数）。rank-128 的 NEON TBL 路径仅用于
-rank 128，其他 rank 回退到完整索引路径，避免原版本对大 rank 使用 128-entry table。
-本次仅修改源码并静态检查，按要求未编译、未执行测试或 benchmark；不提供实测提速百分比。
+相同 seed/key/dimension 的零填充数据、noise 公式和 proof 序列化格式保持不变。
+ARM64 正式路径固定使用 rank-128 NEON TBL；可移植的非 ARM64 路径也仅支持 rank 128。
+不再提供旧版随机填充，也不再有 rank 运行参数或编译选项。
 
 ## BLAKE3 Vector64 正式版（僅 Vector Hash）
 

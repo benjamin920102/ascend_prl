@@ -1,26 +1,21 @@
 /* Kryptex object-protocol frontend; v2 authorization negotiates gzip proofs. */
 #include "pool.h"
+#include "../prl_config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef K
-#define K 4096
-#endif
-#ifndef RANK
-#define RANK 128
-#endif
 #ifndef MDIM
 #define MDIM 131072
 #endif
 
 static void k_init_params(mining_params_t *mp) {
-    mp->m = MDIM; mp->n = MDIM; mp->k = K; mp->rank = RANK;
+    mp->m = MDIM; mp->n = MDIM; mp->k = PRL_K;
     mp->rows[0] = 0; mp->rows[1] = 32; mp->nrows = 2;
     for (size_t i = 0; i < 64; i++) mp->cols[i] = i;
     mp->ncols = 64; mp->have = 1;
     printf("[stratum] kryptex: rank=%ld k=%ld %ldx%ld (miner-chosen)\n",
-           mp->rank, mp->k, mp->m, mp->n);
+           (long)PRL_RANK, mp->k, mp->m, mp->n);
 }
 
 static int k_open(pool_conn_t *c, const char *host, int port,

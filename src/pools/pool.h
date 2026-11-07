@@ -23,7 +23,7 @@ typedef struct {
 } job_t;
 
 typedef struct {
-    long m, n, k, rank;
+    long m, n, k;
     size_t rows[64], cols[64]; size_t nrows, ncols;
     int have;
 } mining_params_t;

@@ -1,28 +1,6 @@
 # Requires the Ascend CANN/aarch64 toolchain; all artifacts are emitted to build/.
-# RANK selects compatible K, NINNER, and NFOLD combinations.
-
-RANK ?= 128
-ifeq ($(RANK),512)
-  K := 8192
-  NINNER := 4
-  NFOLD  := 16
-else ifeq ($(RANK),256)
-  # k=4096 is the ONLY legal k at r=256 (16r=4096<=k<=4r^2, pool cap k<=4096). AI=r/8=32,
-  # the max reachable under a k<=4096 pool. MM_K=NINNER*128=256 (half the 512 L0B-fill).
-  K := 4096
-  NINNER := 2
-  NFOLD  := 16
-else ifeq ($(RANK),128)
-  K := 4096
-  NINNER := 1
-  NFOLD  := 32
-else ifeq ($(RANK),1024)
-  K := 16384
-  NINNER := 8
-  NFOLD  := 16
-else
-  $(error RANK must be 128, 256, 512, or 1024)
-endif
+# Consensus / kernel configuration is fixed: rank=128, K=4096, 32 folds.
+# There is no supported build-time rank or zero-fill mode switch.
 MDIM ?= 16384
 # Host strip slots (separate from kernel BUFS). Use 2 for an A/B baseline.
 PIPE_DEPTH ?= 4
@@ -33,7 +11,7 @@ BLK  ?= $(shell ls -d /root/.cargo/registry/src/*/blake3-1*/c 2>/dev/null | head
 BLK_SRC := $(BLK)/blake3.c $(BLK)/blake3_dispatch.c $(BLK)/blake3_portable.c $(BLK)/blake3_neon.c
 CC   := gcc
 # BLAKE3_USE_TBB uses the pthread split hook in blake3_join.c (not oneTBB).
-CFLAGS := -std=gnu11 -O3 -fopenmp -march=armv8-a+crypto -DBLAKE3_USE_NEON=1 -DBLAKE3_USE_TBB -DK=$(K) -DRANK=$(RANK) -DMDIM=$(MDIM) -DPEARL_PIPE_DEPTH=$(PIPE_DEPTH) -I$(BLK)
+CFLAGS := -std=gnu11 -O3 -fopenmp -march=armv8-a+crypto -DBLAKE3_USE_NEON=1 -DBLAKE3_USE_TBB -DMDIM=$(MDIM) -DPEARL_PIPE_DEPTH=$(PIPE_DEPTH) -I$(BLK)
 RPATH  := -Wl,-rpath,'$$ORIGIN'
 
 .PHONY: all miner kernel proof guard clean
@@ -42,7 +20,7 @@ all: kernel proof miner
 $(OUT):
 	mkdir -p $(OUT)
 
-# Link exactly one frontend per binary; build-time rank/shape is encoded in the proof.
+# Link exactly one frontend per binary; proof rank is fixed at 128.
 ENGINE_SRC := src/miner.c src/proofgz.c src/pools/stratum.c src/prep.c src/scan_strip_async.c src/blake3_join.c src/cpu_budget.c $(BLK_SRC)
 # Use libz's soname: some runtime images lack the libz.so development symlink.
 LINK := -L$(OUT) -lpearl_hlc2 -lpearl_proof -lpthread -l:libz.so.1 $(RPATH)
@@ -59,7 +37,7 @@ guard: $(OUT)
 kernel: $(OUT)
 	cd kernel && rm -rf build && mkdir build && cd build && \
 	  cmake -DCMAKE_ASC_RUN_MODE=npu -DCMAKE_ASC_ARCHITECTURES=dav-2201 \
-	        -DPEARL_PIPE_DEPTH=$(PIPE_DEPTH) -DNINNER=$(NINNER) -DNFOLD=$(NFOLD) -DBUFS=4 -DVEC2X=2 \
+	        -DPEARL_PIPE_DEPTH=$(PIPE_DEPTH) -DBUFS=4 -DVEC2X=2 \
 	        -DCMAKE_MODULE_PATH="$$ASC_MODULES" .. && make -j
 	cp kernel/build/libpearl_hlc2.so $(OUT)/
 

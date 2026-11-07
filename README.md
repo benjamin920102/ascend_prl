@@ -73,14 +73,13 @@ Requirements:
   `proof-ffi/Cargo.toml` to your checkout.
 
 ```bash
-make                     # default RANK=128; builds build/{ascend_prl_kryptex, ascend_prl_k1, libpearl_hlc2.so, libpearl_proof.so}
+make                     # fixed rank=128, K=4096; builds all host/kernel/proof artifacts
 ```
 
 Build flags (`make VAR=...`):
 
 | Flag | Default | Meaning |
 | ---- | ------- | ------- |
-| `RANK` | `128` | Noise rank / kernel config. Current public pools accept `128` (K=4096). |
 | `MDIM` | `16384` | 16384 keeps the pool's block-proof fast (non-orphaning). |
 
 ## Performance and shapes
@@ -88,7 +87,7 @@ Build flags (`make VAR=...`):
 The cube unit can not perform XORs and shifts, and the vector is bad at multiplying matrices. Thus we need to transfer
 each k-partial from cube to vector through L2 (2TB/s aggregated). This limits TH/s ~ OP/s / 2 = (memory bandwidth) * (fold arithmetic intensity). We transfer 8/r bytes in total -> arithmetic intensity = r/8. So the silicone peak TH/s is rank / 8 TH/s.
 
-Coin specs allow r up to 1024, but k >=r * 16, ZK-proof size and check time scales linearly with k. Thin increase block processing time, and therefore - probability of orphan blocks. Current public pools accept only r=128. Other ranks are kept only for custom/non-pool experiments.
+Coin specs define other ranks, but this production source fixes `r=128`, `K=4096`, `NINNER=1`, and `NFOLD=32`. There is no rank selection at build time or runtime.
 
 > Note that **Ascend 310** and **950** do not have these limitations and can (theoretically) reach closer to hardware peak TOP/s.
 
@@ -99,9 +98,8 @@ Network traffic for share submits is reduced **~80–100×** by the Pearl stratu
 
 1. `mining.authorize` sends `"type":"v2"`. When the pool echoes `"type":"v2"`, the miner submits
    `base64(gzip(bincode(plain_proof)))` instead of the ~136 KB plain base64 proof (~15 KB compressed).
-2. Matrix A/B are **zero-seeded** by default (plus an 8-byte seed stamp) so the proof is highly
-   repetitive and actually compresses. Uniform random data does not. Override with `PRL_ZERO_SEED=0`
-   only if you need the legacy random fill.
+2. Matrix A/B are **always zero-filled** apart from an 8-byte seed stamp, so the proof is highly
+   repetitive and compresses. The legacy random-fill mode and its environment switch have been removed.
 
 **Custom share difficulty** ([spec](https://gist.github.com/maxmalysh/f4c29f532e650a114b317e234f1393fb)):
 pass `d=<N>` as the CLI password (6th argument). Example for a high-hashrate worker targeting
@@ -118,7 +116,6 @@ Empty password → pool default (`d=2097152` ≈ 9000 TH). Formula:
 | --- | ------- |
 | `PRL_NOGZIP` | Force v1 (no `"type":"v2"`, plain proofs) |
 | `PRL_GZIP` | Assume gzip without waiting for the authorize ack |
-| `PRL_ZERO_SEED=0` | Legacy random A/B fill (incompressible; not recommended) |
 | `PRL_GZIP_FIELD` | Override submit field name (default still `plain_proof`) |
 
 ## Pool compatibility
@@ -149,8 +146,8 @@ MIT — see [LICENSE](LICENSE). Provided **as-is, without warranty**.
 Default zero-seed matrices are zero-initialized once with `calloc`; subsequent preparation
 updates only the 8-byte seed stamp. A noise generation skips the original A reads except
 for those eight bytes. Full original matrices remain available for hashing/proofs. The
-internal `*_reuse` APIs require zero-initialized, generator-owned buffers and a fixed fill
-mode for the allocation lifetime; existing APIs still clear arbitrary buffers.
+The internal `*_reuse` APIs require zero-initialized, generator-owned buffers; existing non-reuse
+APIs explicitly clear arbitrary buffers before writing the stamp.
 
 BLAKE3 uses a persistent, lazily initialized pthread pool with nonblocking idle-worker
 reservation and serial fallback. A/B roots share the prep team and are submitted sequentially.
@@ -168,11 +165,10 @@ are outside this compute-team budget. On one CPU, prep and proof/encoding serial
 The launcher sets `OMP_WAIT_POLICY=PASSIVE GOMP_SPINCOUNT=0` before process startup; use
 those environment settings when launching manually too, as some runtimes read them before main.
 
-Default zero-seed bytes and noise arithmetic retain the same seed/key/shape semantics.
-Legacy random fill still uses thread-partitioned RNG: changing the actual team size can
-change its matrix for the same seed, as before. The rank-128 NEON table is now guarded by
-rank; larger ranks use full scalar indices. This update was statically reviewed only,
-without compilation, tests, or benchmarks, as requested.
+For the same seed, key and shape, generated matrix bytes and noise arithmetic retain their
+previous default zero-filled behavior. The rank-128 NEON byte-index path is the only AArch64
+production path; the portable fallback also computes rank 128. No dynamic rank or fill-mode
+selection remains.
 
 ## BLAKE3 Vector64-only production hashing
 

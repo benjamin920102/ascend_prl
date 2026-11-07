@@ -1,6 +1,8 @@
 //! C ABI for constructing keyed multileaf Merkle proofs and serializing PlainProof.
 
 use blake3::CHUNK_LEN;
+
+const FIXED_RANK: usize = 128;
 use pearl_blake3::MerkleTree;
 use zk_pow::ffi::plain_proof::{MatrixMerkleProof, PlainProof};
 
@@ -80,7 +82,6 @@ pub unsafe extern "C" fn hash_key(
     header: *const u8,
     header_len: usize,
     common_dim: usize,
-    rank: usize,
     rows_pat: *const usize,
     n_rows: usize,
     cols_pat: *const usize,
@@ -94,7 +95,7 @@ pub unsafe extern "C" fn hash_key(
         .iter().map(|&v| v as u32).collect();
     let cfg = MiningConfiguration {
         common_dim: common_dim as u32,
-        rank: rank as u16,
+        rank: FIXED_RANK as u16,
         mma_type: MMAType::Int7xInt7ToInt32,
         rows_pattern: PeriodicPattern::from_list(&rows).unwrap(),
         cols_pattern: PeriodicPattern::from_list(&cols).unwrap(),
@@ -118,7 +119,6 @@ pub unsafe extern "C" fn build_proof_bin_cached_b(
     m: usize,
     n: usize,
     k: usize,
-    rank: usize,
     key: *const u8,
     a_rows: *const usize,
     na: usize,
@@ -143,7 +143,7 @@ pub unsafe extern "C" fn build_proof_bin_cached_b(
     let make_bin = || {
         let proof = PlainProof {
             m, n, k,
-            noise_rank: rank,
+            noise_rank: FIXED_RANK,
             a: matrix_proof(a, key32, a_rows, k),
             bt: if b_generation == 0 {
                 matrix_proof(b, key32, b_cols, k)
@@ -173,7 +173,6 @@ pub unsafe extern "C" fn build_proof_bin(
     m: usize,
     n: usize,
     k: usize,
-    rank: usize,
     key: *const u8,
     a_rows: *const usize,
     na: usize,
@@ -182,6 +181,6 @@ pub unsafe extern "C" fn build_proof_bin(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    build_proof_bin_cached_b(a, b, m, n, k, rank, key, a_rows, na,
+    build_proof_bin_cached_b(a, b, m, n, k, key, a_rows, na,
                              b_cols, nb, out, cap, 0)
 }
